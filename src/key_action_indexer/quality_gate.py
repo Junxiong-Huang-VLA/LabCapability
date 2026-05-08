@@ -13,6 +13,8 @@ from .schemas import read_jsonl
 
 QUALITY_GATE_SCHEMA_VERSION = "key_action_quality_gate.v1"
 QUALITY_GATE_FILENAME = "quality_gate.json"
+LOW_CONFIDENCE_THRESHOLD = 0.55
+REVIEWED_VISUAL_CONFIDENCE_FLOOR = 0.5
 
 DEFAULT_GATE_POLICY = {
     "min_health_score": 82,
@@ -193,7 +195,10 @@ def _low_confidence_segment_count(session: Path) -> int:
     count = 0
     for row in _read_jsonl(reviewed_metadata_path(session, "key_action_segments.jsonl")):
         confidence = _segment_confidence(row)
-        if confidence is None or confidence < 0.55:
+        if confidence is None:
+            count += 1
+            continue
+        if confidence < LOW_CONFIDENCE_THRESHOLD and not _has_approved_visual_support(row, confidence):
             count += 1
     return count
 
@@ -245,6 +250,20 @@ def _segment_confidence(row: Mapping[str, Any]) -> float | None:
     values = [_float(cv.get("avg_active_score"), None), _float(cv.get("avg_motion_score"), None), _float(cv.get("confidence"), None)]
     values = [value for value in values if value is not None]
     return sum(values) / len(values) if values else None
+
+
+def _has_approved_visual_support(row: Mapping[str, Any], confidence: float) -> bool:
+    if confidence < REVIEWED_VISUAL_CONFIDENCE_FLOOR:
+        return False
+    review = row.get("review") if isinstance(row.get("review"), Mapping) else {}
+    if str(review.get("decision") or row.get("review_status") or "").casefold() != "approved":
+        return False
+    evidence_level = str(row.get("evidence_level") or "").casefold()
+    if evidence_level in {"visual_confirmed", "multi_view_confirmed", "manual_confirmed"}:
+        return True
+    quality = row.get("quality") if isinstance(row.get("quality"), Mapping) else {}
+    quality_confidence = str(quality.get("confidence") or "").casefold()
+    return quality_confidence in {"medium", "high"} and bool(row.get("keyframes") or row.get("asset_bindings") or row.get("visual_keywords"))
 
 
 def _check_max(name: str, actual: float | None, maximum: float, message: str) -> dict[str, Any]:

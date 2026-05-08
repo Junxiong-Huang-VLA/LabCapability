@@ -75,6 +75,35 @@ def test_quality_gate_blocks_missing_adapter_inputs_and_unreviewed_items(tmp_pat
     assert "missing_adapter_count" in names
 
 
+def test_quality_gate_accepts_approved_medium_visual_segment_near_threshold(tmp_path: Path) -> None:
+    _base_session(tmp_path)
+    metadata = tmp_path / "metadata"
+    write_jsonl(metadata / "object_tracks.jsonl", [])
+    write_jsonl(metadata / "panel_ocr.jsonl", [])
+    write_jsonl(metadata / "liquid_state.jsonl", [])
+    write_jsonl(metadata / "container_state.jsonl", [])
+    write_jsonl(
+        metadata / "reviewed_segments.jsonl",
+        [
+            {
+                "segment_id": "seg_1",
+                "start_sec": 0.0,
+                "end_sec": 10.0,
+                "boundary_confidence": 0.548,
+                "evidence_level": "visual_confirmed",
+                "quality": {"confidence": "medium"},
+                "visual_keywords": ["balance"],
+                "review": {"decision": "approved"},
+            }
+        ],
+    )
+
+    gate = build_quality_gate(tmp_path)
+
+    assert gate["summary"]["low_confidence_segment_count"] == 0
+    assert not any(item["name"] == "low_confidence_segment_count" for item in gate["blocking_checks"])
+
+
 def test_validate_evidence_adapters_reports_semantic_support_issues(tmp_path: Path) -> None:
     _base_session(tmp_path)
     metadata = tmp_path / "metadata"
