@@ -847,9 +847,15 @@ def approve_material_candidates(
             "notes": notes,
         },
     )
+    approved_for_sync = [
+        row
+        for row in updated_rows
+        if str(row.get("candidate_status") or "").lower() == "approved"
+        or str(row.get("review_status") or "").lower() == "accepted"
+    ]
     sync_summary = reset_material_references_to_approved_candidates(
         session_root,
-        approved_rows=[row for row in updated_rows if str(row.get("candidate_id") or "") in selected_ids],
+        approved_rows=approved_for_sync,
         merge_existing=True,
     )
     return {
