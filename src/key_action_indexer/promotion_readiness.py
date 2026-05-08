@@ -52,6 +52,7 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
         f"- Sessions audited: `{report.get('session_count')}`",
         f"- Active promoted: `{summary.get('active_promoted_count', 0)}`",
         f"- Latest already promoted: `{summary.get('promoted_count', 0)}`",
+        f"- Candidate validation failed: `{summary.get('candidate_validation_failed_count', 0)}`",
         f"- Needs candidate validation: `{summary.get('needs_candidate_validation_count', 0)}`",
         f"- Ready to promote: `{summary.get('ready_to_promote_count', 0)}`",
         f"- Blocked: `{summary.get('blocked_count', 0)}`",
@@ -59,8 +60,8 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
         "",
         "## Sessions",
         "",
-        "| Session | Status | Latest | Promoted | Release state | Gate | Gold | Eval | Adapter semantic | Queue pending | Blockers |",
-        "|---|---|---|---|---|---|---:|---|---:|---:|---:|",
+        "| Session | Status | Latest | Promoted | Release state | Gate | Gold | Eval | Candidate eval | Adapter semantic | Queue pending | Blockers |",
+        "|---|---|---|---|---|---|---:|---|---|---:|---:|---:|",
     ]
     for row in report.get("sessions") or []:
         if not isinstance(row, Mapping):
@@ -71,6 +72,8 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
         evaluation = _as_dict(row.get("retrieval_eval"))
         adapters = _as_dict(row.get("adapter_validation"))
         queue = _as_dict(row.get("review_queue"))
+        candidate = _as_dict(releases.get("latest_candidate_eval"))
+        candidate_label = _candidate_eval_label(candidate)
         lines.append(
             "| "
             f"`{row.get('session_id')}` | "
@@ -81,6 +84,7 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
             f"`{gate.get('status') or 'missing'}` | "
             f"{gold.get('human_verified_query_count') or 0}/{gold.get('query_count') or report.get('query_count_required') or 0} | "
             f"`{evaluation.get('status') or 'missing'}` | "
+            f"`{candidate_label}` | "
             f"{adapters.get('semantic_issue_count') or 0} | "
             f"{queue.get('pending_count') or 0} | "
             f"{len(row.get('blockers') or [])} |"
@@ -116,6 +120,8 @@ def _audit_session(session: Path, *, query_count: int) -> dict[str, Any]:
     evaluation = _eval_summary(session, query_count=query_count)
     queue = _review_queue_summary(session, gate)
     releases = _release_summary(session)
+    releases["latest_candidate_eval"] = _candidate_eval_summary(session, releases.get("latest_version"))
+    releases["latest_candidate_gate"] = _candidate_gate_summary(session, releases.get("latest_version"))
     releases.update(_candidate_validation_summary(gate, evaluation, releases))
     blockers = _blockers(session, gate=gate, adapters=adapters, gold=gold, evaluation=evaluation, releases=releases, query_count=query_count)
     readiness = _readiness_status(blockers=blockers, releases=releases)
@@ -323,11 +329,64 @@ def _release_summary(session: Path) -> dict[str, Any]:
     }
 
 
+def _candidate_eval_summary(session: Path, version: Any) -> dict[str, Any]:
+    if not version:
+        return {}
+    safe_version = _safe_path_token(version)
+    candidates = [
+        session / "evaluation" / f"default_chinese_query_validation.{safe_version}.candidate.json",
+        session / "evaluation" / "candidates" / f"candidate_{safe_version}_default_chinese_query_validation.failed.json",
+        session / "evaluation" / f"candidate_{safe_version}_default_chinese_query_validation.failed.json",
+    ]
+    for path in candidates:
+        data = _read_json(path)
+        if not data:
+            continue
+        thresholds = data.get("threshold_failures") if isinstance(data.get("threshold_failures"), list) else []
+        return {
+            "available": True,
+            "path": str(path),
+            "status": data.get("status"),
+            "query_count": int(data.get("query_count") or 0),
+            "top1_hit_rate": data.get("top1_hit_rate"),
+            "top3_hit_rate": data.get("topk_hit_rate"),
+            "expected_id_hit_rate": data.get("expected_id_hit_rate"),
+            "expected_time_window_hit_rate": data.get("expected_time_window_hit_rate"),
+            "traceability_hit_rate": data.get("traceability_hit_rate"),
+            "failed_query_count": int(data.get("failed_query_count") or 0),
+            "threshold_failure_count": len(thresholds),
+            "threshold_failures": thresholds,
+            "failure_profile": _candidate_failure_profile(data),
+            "category_failures": _category_failure_summary(data),
+        }
+    return {}
+
+
+def _candidate_gate_summary(session: Path, version: Any) -> dict[str, Any]:
+    if not version:
+        return {}
+    path = session / "metadata" / f"quality_gate.{_safe_path_token(version)}.candidate.json"
+    data = _read_json(path)
+    if not data:
+        return {}
+    summary = _as_dict(data.get("summary"))
+    return {
+        "available": True,
+        "path": str(path),
+        "status": data.get("status"),
+        "can_mark_complete": bool(data.get("can_mark_complete")),
+        "blocking_count": summary.get("blocking_count"),
+        "reviewed_release": summary.get("reviewed_release"),
+    }
+
+
 def _candidate_validation_summary(gate: Mapping[str, Any], evaluation: Mapping[str, Any], releases: Mapping[str, Any]) -> dict[str, Any]:
     latest_version = releases.get("latest_version")
     promoted_version = releases.get("promoted_version")
     gate_release = _as_dict(gate.get("summary")).get("reviewed_release")
     eval_index_dir = str(evaluation.get("index_dir") or "")
+    candidate_eval = _as_dict(releases.get("latest_candidate_eval"))
+    candidate_gate = _as_dict(releases.get("latest_candidate_gate"))
     eval_looks_latest = bool(
         latest_version
         and (
@@ -347,10 +406,27 @@ def _candidate_validation_summary(gate: Mapping[str, Any], evaluation: Mapping[s
             "candidate_validation_release": latest_version,
             "candidate_validation_note": "Latest reviewed release is already the promoted release.",
         }
+    if candidate_eval.get("available") and candidate_eval.get("status") == "fail":
+        return {
+            "candidate_validation_current": False,
+            "candidate_validation_release": latest_version,
+            "candidate_validation_status": "failed",
+            "candidate_validation_note": f"Latest release {latest_version} has a failed candidate retrieval eval.",
+        }
+    if candidate_eval.get("available") and candidate_eval.get("status") == "pass" and (
+        not candidate_gate.get("available") or candidate_gate.get("status") == "pass"
+    ):
+        return {
+            "candidate_validation_current": True,
+            "candidate_validation_release": latest_version,
+            "candidate_validation_status": "pass",
+            "candidate_validation_note": f"Latest release {latest_version} has passing candidate validation artifacts.",
+        }
     current = bool(gate_release == latest_version and (not evaluation.get("available") or eval_looks_latest))
     return {
         "candidate_validation_current": current,
         "candidate_validation_release": gate_release,
+        "candidate_validation_status": "pass" if current else "missing",
         "candidate_validation_note": (
             "Quality gate/eval artifacts reflect the latest reviewed release."
             if current
@@ -421,6 +497,30 @@ def _blockers(
                 "reviewed_release_missing",
                 "No frozen reviewed release is available.",
                 f"python -m key_action_indexer.cli freeze-reviewed-dataset --session-dir {session}",
+            )
+        )
+    candidate_eval = _as_dict(releases.get("latest_candidate_eval"))
+    if candidate_eval.get("available") and candidate_eval.get("status") == "fail":
+        expected_id = candidate_eval.get("expected_id_hit_rate")
+        time_window = candidate_eval.get("expected_time_window_hit_rate")
+        profile = candidate_eval.get("failure_profile")
+        profile_suffix = f" ({profile})" if profile else ""
+        time_suffix = f", expected_time_window_hit_rate={time_window}" if time_window is not None else ""
+        blockers.append(
+            _blocker(
+                "candidate_retrieval_eval_failed",
+                f"Latest release candidate retrieval eval failed with expected_id_hit_rate={expected_id}{time_suffix}{profile_suffix}.",
+                f"python -m key_action_indexer.cli promote-reviewed-release --session-dir {session} --version {releases.get('latest_version')} --reviewer <reviewer> --query-count {query_count}",
+                details={
+                    "candidate_eval_path": candidate_eval.get("path"),
+                    "top3_hit_rate": candidate_eval.get("top3_hit_rate"),
+                    "expected_id_hit_rate": expected_id,
+                    "expected_time_window_hit_rate": time_window,
+                    "traceability_hit_rate": candidate_eval.get("traceability_hit_rate"),
+                    "failure_profile": profile,
+                    "category_failures": candidate_eval.get("category_failures") or [],
+                    "threshold_failures": candidate_eval.get("threshold_failures") or [],
+                },
             )
         )
     if not gate:
@@ -526,6 +626,8 @@ def _blocker(code: str, message: str, suggested_command: str | None, *, details:
 
 
 def _readiness_status(*, blockers: list[Mapping[str, Any]], releases: Mapping[str, Any]) -> str:
+    if any(str(blocker.get("code") or "") == "candidate_retrieval_eval_failed" for blocker in blockers):
+        return "candidate_validation_failed"
     if blockers:
         return "blocked"
     if releases.get("latest_is_promoted"):
@@ -571,6 +673,7 @@ def _summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
         "promoted_count": statuses.get("promoted", 0),
         "active_promoted_count": sum(1 for row in rows if _as_dict(row.get("releases")).get("promoted_available")),
         "ready_to_promote_count": statuses.get("ready_to_promote", 0),
+        "candidate_validation_failed_count": statuses.get("candidate_validation_failed", 0),
         "needs_candidate_validation_count": statuses.get("needs_candidate_validation", 0),
         "blocked_count": statuses.get("blocked", 0),
         "status_counts": dict(sorted(statuses.items())),
@@ -646,6 +749,74 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _candidate_eval_label(candidate: Mapping[str, Any]) -> str:
+    if not candidate:
+        return "missing"
+    status = str(candidate.get("status") or "unknown")
+    expected_id = _format_rate(candidate.get("expected_id_hit_rate"))
+    time_window = _format_rate(candidate.get("expected_time_window_hit_rate"))
+    if expected_id is None and time_window is None:
+        return status
+    if time_window is None:
+        return f"{status} id={expected_id}"
+    if expected_id is None:
+        return f"{status} time={time_window}"
+    return f"{status} id={expected_id} time={time_window}"
+
+
+def _candidate_failure_profile(data: Mapping[str, Any]) -> str | None:
+    if data.get("status") != "fail":
+        return None
+    expected_id = _as_float(data.get("expected_id_hit_rate"))
+    time_window = _as_float(data.get("expected_time_window_hit_rate"))
+    traceability = _as_float(data.get("traceability_hit_rate"))
+    if expected_id is not None and expected_id < 0.75 and time_window is not None and time_window >= 0.95:
+        return "time_window_pass_id_fail"
+    if traceability is not None and traceability < 0.75:
+        return "traceability_fail"
+    return "retrieval_threshold_fail"
+
+
+def _category_failure_summary(data: Mapping[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
+    categories = _as_dict(data.get("category_summary"))
+    rows: list[dict[str, Any]] = []
+    for category, raw in categories.items():
+        item = _as_dict(raw)
+        failed = int(item.get("failed_query_count") or 0)
+        if failed <= 0:
+            continue
+        rows.append(
+            {
+                "category": str(category),
+                "query_count": int(item.get("query_count") or 0),
+                "failed_query_count": failed,
+                "top3_hit_rate": item.get("top3_hit_rate"),
+                "expected_id_hit_rate": item.get("expected_id_hit_rate"),
+            }
+        )
+    rows.sort(key=lambda item: (-int(item["failed_query_count"]), str(item["category"])))
+    return rows[:limit]
+
+
+def _format_rate(value: Any) -> str | None:
+    number = _as_float(value)
+    if number is None:
+        return None
+    return f"{number:.2f}"
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_path_token(value: Any) -> str:
+    text = str(value or "candidate")
+    return "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in text)
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:

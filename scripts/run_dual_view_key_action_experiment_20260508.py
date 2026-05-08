@@ -68,17 +68,11 @@ def _probe(path: Path, index: int, role: str, camera_id: str) -> dict[str, Any]:
     return metadata
 
 
-def _prepare_experiment(
-    *,
-    experiment_id: str,
-    title: str,
-    input_dir: Path,
-) -> dict[str, Any]:
+def _prepare_experiment(*, experiment_id: str, title: str, input_dir: Path) -> dict[str, Any]:
     import main as backend_main
 
     session = _read_json(input_dir / "session.json")
     session_start_time = str(session.get("start_utc") or _now_iso())
-
     third_source = _find_required_input(input_dir, "camera_00*_rgb_1920x1080_30fps.mp4")
     first_source = _find_required_input(input_dir, "camera_01*_rgb_1920x1080_30fps.mp4")
     third_meta_source = _find_required_input(input_dir, "camera_00*_rgb_1920x1080_30fps.json")
@@ -89,7 +83,6 @@ def _prepare_experiment(
     raw_dir = exp_dir / "raw"
     third_path = raw_dir / "top_view.browser_h264.mp4"
     first_path = raw_dir / "bottom_view.browser_h264.mp4"
-
     _copy2(third_source, third_path)
     _copy2(first_source, first_path)
     _copy2(third_meta_source, raw_dir / "top_view.source.json")
@@ -100,7 +93,6 @@ def _prepare_experiment(
 
     third_metadata = _probe(third_path, 0, "third_person", "top_view")
     first_metadata = _probe(first_path, 1, "first_person", "bottom_view")
-    created_at = session_start_time
     exp = {
         "experiment_id": experiment_id,
         "title": title,
@@ -110,7 +102,7 @@ def _prepare_experiment(
         ),
         "status": "video_uploaded",
         "processing_stage": "key_action_index",
-        "created_at": created_at,
+        "created_at": session_start_time,
         "started_at": _now_iso(),
         "completed_at": None,
         "analyzed_at": None,
@@ -179,14 +171,12 @@ def _write_post_run_context(session_dir: Path) -> dict[str, Any]:
     return import_lightweight_context(
         session_dir,
         sop_text=(
-            "1. 准备称量区域、称量纸和电子天平，确认手套手与称量纸/容器的接触证据。\n"
+            "1. 准备称量区域、称量纸和电子天平，确认手套手与称量纸、容器的接触证据。\n"
             "2. 使用药匙或刮勺取样并转移固体，关注 spatula 与手套手接触。\n"
-            "3. 在电子天平上完成称量或读数确认，关注 balance 与样品/称量纸的同框证据。\n"
+            "3. 在电子天平上完成称量或读数确认，关注 balance 与样品、称量纸的同框证据。\n"
             "4. 操作试剂瓶或样品容器并收尾，关注 reagent_bottle、sample_bottle 与手套手接触。"
         ),
-        note_text=(
-            "本次用户指定双视角映射：camera_00 为第三人称视角，camera_01 为第一人称视角。"
-        ),
+        note_text="本次用户指定双视角映射：camera_00 为第三人称视角，camera_01 为第一人称视角。",
         record_text="实验记录来自 2026-05-08 15:36:48 左右采集的双 Orbbec RGB 会话。",
     )
 
@@ -211,28 +201,29 @@ def _run_post_refresh(experiment_id: str, session_dir: Path) -> dict[str, Any]:
     from key_action_indexer.health_report import build_run_health_report
     from key_action_indexer.micro_quality_enrichment import enrich_micro_quality
     from key_action_indexer.quality_gate import build_quality_gate
+    from key_action_indexer.reviewed_dataset import freeze_reviewed_dataset
     from key_action_indexer.video_understanding import build_video_understanding
 
+    queries = ["固体称量", "balance weighing", "称量纸 手套 天平", "hand object interaction"]
     post: dict[str, Any] = {}
     post["context_text"] = _write_post_run_context(session_dir)
     post["micro_quality"] = enrich_micro_quality(session_dir)
     post["video_understanding"] = build_video_understanding(session_dir)
-    post["derived_refresh"] = refresh_derived_artifacts(
-        session_dir,
-        query_texts=["固体称量", "balance weighing", "称量纸 手套 天平", "hand object interaction"],
-    )
+    post["derived_refresh"] = refresh_derived_artifacts(session_dir, query_texts=queries)
     post["health"] = build_run_health_report(
         session_dir,
-        query_texts=["固体称量", "balance weighing", "称量纸 手套 天平", "hand object interaction"],
+        query_texts=queries,
         output_json=session_dir / "reports" / "run_health_report.json",
         output_md=session_dir / "reports" / "run_health_report.md",
     )
+    post["reviewed_dataset"] = freeze_reviewed_dataset(session_dir)
     post["quality_gate"] = build_quality_gate(session_dir, output_path=session_dir / "reports" / "quality_gate.json")
 
     status = backend_main._read_key_action_status(experiment_id)
     status["post_refresh"] = {
         "micro_quality_report": post["micro_quality"].get("artifacts", {}),
         "derived_refresh_summary": post["derived_refresh"].get("paths", {}),
+        "reviewed_release": (post["reviewed_dataset"].get("release") or {}).get("version"),
         "health_status": post["health"].get("status"),
         "health_gate_status": post["health"].get("gate_status"),
         "quality_gate_status": post["quality_gate"].get("status") or post["quality_gate"].get("gate_status"),
@@ -245,11 +236,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import main as backend_main
 
     input_dir = Path(args.input_dir)
-    info = _prepare_experiment(
-        experiment_id=args.experiment_id,
-        title=args.title,
-        input_dir=input_dir,
-    )
+    info = _prepare_experiment(experiment_id=args.experiment_id, title=args.title, input_dir=input_dir)
     yolo_device = _resolve_yolo_device(args.yolo_device)
     detection_config = backend_main._with_default_key_action_yolo_config(
         {

@@ -125,6 +125,55 @@ def test_promotion_readiness_flags_latest_release_needing_candidate_validation(t
     assert report["summary"]["active_promoted_count"] == 1
 
 
+def test_promotion_readiness_reports_failed_latest_candidate_eval(tmp_path: Path) -> None:
+    session = tmp_path / "exp_4" / "key_action_index"
+    _write_promoted_session(session, version="v003", query_count=3)
+    latest_dir = session / "reviewed_releases" / "v004"
+    latest_dir.mkdir()
+    (latest_dir / "reviewed_release_manifest.json").write_text(
+        json.dumps({"version": "v004", "release_dir": str(latest_dir)}),
+        encoding="utf-8",
+    )
+    (session / "reviewed_releases" / "latest_reviewed_release.json").write_text(
+        json.dumps({"active_version": "v004", "release_dir": str(latest_dir)}),
+        encoding="utf-8",
+    )
+    (session / "evaluation" / "default_chinese_query_validation.v004.candidate.json").write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "query_count": 3,
+                "topk_hit_rate": 0.33,
+                "expected_id_hit_rate": 0.33,
+                "expected_time_window_hit_rate": 1.0,
+                "traceability_hit_rate": 1.0,
+                "failed_query_count": 2,
+                "threshold_failures": [{"metric": "expected_id_hit_rate", "actual": 0.33, "minimum": 0.75}],
+                "category_summary": {
+                    "weighing": {"query_count": 2, "failed_query_count": 2, "top3_hit_rate": 0.0, "expected_id_hit_rate": 0.0},
+                    "mixing": {"query_count": 1, "failed_query_count": 0, "top3_hit_rate": 1.0, "expected_id_hit_rate": 1.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_promotion_readiness_report([session], query_count=3)
+    row = report["sessions"][0]
+    codes = {item["code"] for item in row["blockers"]}
+
+    assert row["readiness_status"] == "candidate_validation_failed"
+    assert row["releases"]["candidate_validation_status"] == "failed"
+    assert row["releases"]["latest_candidate_eval"]["status"] == "fail"
+    assert row["releases"]["latest_candidate_eval"]["failure_profile"] == "time_window_pass_id_fail"
+    assert row["releases"]["latest_candidate_eval"]["category_failures"][0]["category"] == "weighing"
+    assert "candidate_retrieval_eval_failed" in codes
+    candidate_blocker = next(item for item in row["blockers"] if item["code"] == "candidate_retrieval_eval_failed")
+    assert candidate_blocker["details"]["expected_time_window_hit_rate"] == 1.0
+    assert candidate_blocker["details"]["failure_profile"] == "time_window_pass_id_fail"
+    assert report["summary"]["candidate_validation_failed_count"] == 1
+
+
 def test_promotion_audit_cli_writes_reports(tmp_path: Path, capsys) -> None:
     session = tmp_path / "exp_1" / "key_action_index"
     _write_promoted_session(session, version="v001", query_count=2)
