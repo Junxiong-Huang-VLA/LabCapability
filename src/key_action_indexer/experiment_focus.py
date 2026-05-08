@@ -214,6 +214,51 @@ def _fallback_anchor(manifest: SessionManifest, segments: list[dict[str, Any]]) 
     }
 
 
+def _episode_focus_window(manifest: SessionManifest, session_root: Path) -> dict[str, Any] | None:
+    episodes = _read_rows(session_root / "metadata" / "experiment_episodes.jsonl")
+    candidates = []
+    for row in episodes:
+        start = _safe_float(row.get("session_start_sec"))
+        end = _safe_float(row.get("session_end_sec"))
+        if start is None and row.get("global_start_time"):
+            start = _session_sec(manifest, str(row.get("global_start_time")))
+        if end is None and row.get("global_end_time"):
+            end = _session_sec(manifest, str(row.get("global_end_time")))
+        if start is None or end is None or end <= start:
+            continue
+        candidates.append((float(start), float(end), row))
+    if not candidates:
+        return None
+    start_sec, end_sec, episode = min(candidates, key=lambda item: item[0])
+    global_start = local_sec_to_global_time(VideoSource("session", "session", manifest.session_start_time), start_sec)
+    global_end = local_sec_to_global_time(VideoSource("session", "session", manifest.session_start_time), end_sec)
+    segment_id = episode.get("segment_id") or episode.get("episode_id")
+    summary = {
+        "schema_version": FOCUS_WINDOW_SCHEMA,
+        "detected": True,
+        "source": "first_true_experiment_episode",
+        "episode_count": len(candidates),
+        "episode_id": episode.get("episode_id"),
+        "segment_id": segment_id,
+        "start_sec": round(start_sec, 6),
+        "true_start_sec": _safe_float(episode.get("true_start_sec"), start_sec),
+        "end_sec": round(end_sec, 6),
+        "duration_sec": round(end_sec - start_sec, 6),
+        "global_start_time": global_start.isoformat(),
+        "global_end_time": global_end.isoformat(),
+        "anchor": {
+            "source": "experiment_episode",
+            "episode_id": episode.get("episode_id"),
+            "segment_id": segment_id,
+            "primary_objects": episode.get("primary_objects", {}),
+        },
+        "included_segment_ids": [str(segment_id)] if segment_id else [],
+        "segment_count": 1 if segment_id else 0,
+    }
+    _write_json(session_root / "metadata" / "experiment_focus_window.json", summary)
+    return summary
+
+
 def select_experiment_focus_window(
     session_dir: str | Path,
     *,
@@ -224,6 +269,10 @@ def select_experiment_focus_window(
 ) -> dict[str, Any]:
     session_root = Path(session_dir)
     manifest = SessionManifest.load(session_root / "manifest.json")
+    episode_window = _episode_focus_window(manifest, session_root)
+    if episode_window is not None:
+        return episode_window
+
     segments = _read_rows(session_root / "metadata" / "key_action_segments.jsonl")
     segments_by_id = {str(row.get("segment_id")): row for row in segments if row.get("segment_id")}
     anchor = _earliest_candidate_anchor(manifest, session_root, segments_by_id) or _fallback_anchor(manifest, segments)

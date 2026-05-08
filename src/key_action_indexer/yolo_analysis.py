@@ -837,7 +837,7 @@ def run_yolo_on_segment_clips(
                 resolved_model, model = _model_for_view(requested_view)
                 if model is None:
                     continue
-                output_clip = session_root / "clips" / segment_id / f"{view}_yolo_annotated.mp4"
+                output_clip = clip_path.with_name(f"{view}_yolo_annotated.mp4")
                 clip_result = annotate_clip_with_yolo(
                     clip_path,
                     output_clip,

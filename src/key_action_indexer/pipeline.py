@@ -21,6 +21,7 @@ from .debug_viz import save_frame_score_plot, save_roi_preview, save_segment_con
 from .data_governance import build_data_governance_report
 from .description_builder import build_segment_description
 from .evidence import apply_segment_evidence
+from .episode_segmenter import rebuild_episode_segments_from_micro_evidence
 from .history_learning import build_history_model
 from .input_ingestion import ingest_manifest_inputs, write_video_source_metadata
 from .evaluation import build_pipeline_evaluation_report, compute_micro_quality_stats
@@ -1676,6 +1677,34 @@ def run_pipeline(
     write_jsonl(paths["metadata"] / "micro_segments_raw.jsonl", raw_micro_rows)
     write_jsonl(paths["metadata"] / "micro_segments.jsonl", micro_rows)
     write_jsonl(paths["metadata"] / "micro_vector_metadata.jsonl", micro_vector_metadata)
+
+    print("[pipeline] Rebuilding true experiment episodes from YOLO micro evidence")
+    try:
+        episode_rebuild_summary = rebuild_episode_segments_from_micro_evidence(
+            manifest=manifest,
+            session_dir=output_dir,
+            key_segments=key_segments,
+            micro_rows=micro_rows,
+            yolo_frame_rows=micro_source_rows,
+            utterances=utterances,
+            detector_summary=detector_summary if isinstance(detector_summary, dict) else None,
+            dry_run=dry_run,
+        )
+        if episode_rebuild_summary.get("rebuilt"):
+            key_segment_rows_for_index = read_jsonl(paths["metadata"] / "key_action_segments.jsonl")
+            micro_rows = read_jsonl(paths["metadata"] / "micro_segments.jsonl")
+            micro_vector_metadata = read_jsonl(paths["metadata"] / "micro_vector_metadata.jsonl")
+            vector_metadata = [
+                row
+                for row in read_jsonl(paths["metadata"] / "vector_metadata.jsonl")
+                if str(row.get("index_level") or "segment") == "segment"
+            ]
+        else:
+            key_segment_rows_for_index = [to_json_dict(item) for item in key_segments]
+    except Exception as exc:
+        episode_rebuild_summary = {"rebuilt": False, "error": str(exc)}
+        _write_json(paths["metadata"] / "episode_segmentation_summary.json", episode_rebuild_summary)
+        key_segment_rows_for_index = [to_json_dict(item) for item in key_segments]
     micro_quality_stats = compute_micro_quality_stats(
         paths["metadata"] / "micro_segments.jsonl",
         paths["evaluation"] / "micro_quality_stats.json",
@@ -1692,7 +1721,8 @@ def run_pipeline(
     except Exception as exc:
         experiment_focus_summary = {"available": False, "error": str(exc)}
         _write_json(paths["metadata"] / "experiment_focus_clips.json", experiment_focus_summary)
-    combined_vector_metadata = [to_json_dict(item) for item in vector_metadata] + micro_vector_metadata
+    segment_vector_rows = [to_json_dict(item) for item in vector_metadata]
+    combined_vector_metadata = segment_vector_rows + micro_vector_metadata
     write_jsonl(paths["metadata"] / "vector_metadata.jsonl", combined_vector_metadata)
 
     print("[pipeline] Building vector index")
@@ -1702,7 +1732,7 @@ def run_pipeline(
     write_jsonl(paths["index"] / "docstore.jsonl", combined_vector_metadata)
 
     segment_index = VectorIndex()
-    segment_index.build([item.index_text for item in vector_metadata], vector_metadata)
+    segment_index.build([str(item.get("index_text") or "") for item in segment_vector_rows], segment_vector_rows)
     segment_index.save(paths["index"] / "segments")
     micro_index = VectorIndex()
     micro_index.build([str(item.get("index_text") or "") for item in micro_vector_metadata], micro_vector_metadata)
@@ -1793,13 +1823,17 @@ def run_pipeline(
     report_path = paths["reports"] / "mvp_validation_report.md"
     formal_report_path = paths["reports"] / "formal_validation_report.md"
     formal_report_path = paths["reports"] / "formal_validation_report.md"
-    total_action_duration = float(sum(segment.duration_sec for segment in detected_segments))
+    final_segment_rows = read_jsonl(paths["metadata"] / "key_action_segments.jsonl") if (paths["metadata"] / "key_action_segments.jsonl").exists() else key_segment_rows_for_index
+    total_action_duration = float(
+        sum(float(row.get("duration_sec") or 0.0) for row in final_segment_rows if isinstance(row, dict))
+    )
     summary = {
         "session_id": manifest.session_id,
         "output_dir": str(output_dir),
         "dry_run": dry_run,
-        "segment_count": len(key_segments),
+        "segment_count": len(final_segment_rows),
         "total_action_duration_sec": total_action_duration,
+        "episode_segmentation": episode_rebuild_summary,
         "artifacts": {
             "detected_segments": str(paths["cv_outputs"] / "detected_segments.jsonl"),
             "experiment_episodes": str(paths["metadata"] / "experiment_episodes.jsonl"),
