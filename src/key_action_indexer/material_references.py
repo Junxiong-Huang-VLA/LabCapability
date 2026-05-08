@@ -494,7 +494,7 @@ def _copy_simplified_materials(ref_root: Path, simplified_root: Path, summary: d
     if ref_root.resolve() == simplified_root.resolve():
         return
     if simplified_root.exists():
-        for name in (KEYFRAME_DIR_NAME, KEY_CLIP_DIR_NAME, "manifest.json", "README.md", f"{MATERIAL_INDEX_BASENAME}.json", f"{MATERIAL_INDEX_BASENAME}.jsonl"):
+        for name in (KEYFRAME_DIR_NAME, KEY_CLIP_DIR_NAME, REPORT_DIR_NAME, "manifest.json", "README.md", f"{MATERIAL_INDEX_BASENAME}.json", f"{MATERIAL_INDEX_BASENAME}.jsonl"):
             target = simplified_root / name
             if target.is_dir():
                 shutil.rmtree(target)
