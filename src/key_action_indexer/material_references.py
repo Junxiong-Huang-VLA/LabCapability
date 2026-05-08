@@ -497,9 +497,21 @@ def _copy_simplified_materials(ref_root: Path, simplified_root: Path, summary: d
         for name in (KEYFRAME_DIR_NAME, KEY_CLIP_DIR_NAME, REPORT_DIR_NAME, "manifest.json", "README.md", f"{MATERIAL_INDEX_BASENAME}.json", f"{MATERIAL_INDEX_BASENAME}.jsonl"):
             target = simplified_root / name
             if target.is_dir():
-                shutil.rmtree(target)
+                for stale_file in target.iterdir():
+                    if not stale_file.is_file():
+                        continue
+                    try:
+                        stale_file.unlink()
+                    except PermissionError:
+                        # Browser previews can keep MP4 handles open on Windows.
+                        # The index below is authoritative, so a locked stale file
+                        # should not block publishing newly approved materials.
+                        pass
             elif target.exists():
-                target.unlink()
+                try:
+                    target.unlink()
+                except PermissionError:
+                    pass
     for folder in (KEYFRAME_DIR_NAME, KEY_CLIP_DIR_NAME, REPORT_DIR_NAME):
         source_dir = ref_root / folder
         target_dir = simplified_root / folder
@@ -507,7 +519,12 @@ def _copy_simplified_materials(ref_root: Path, simplified_root: Path, summary: d
         if source_dir.is_dir():
             for source in source_dir.iterdir():
                 if source.is_file():
-                    shutil.copy2(source, target_dir / source.name)
+                    target = target_dir / source.name
+                    try:
+                        shutil.copy2(source, target)
+                    except PermissionError:
+                        if not target.exists():
+                            raise
     simplified_summary = dict(summary)
     simplified_summary["material_references"] = str(simplified_root)
     simplified_summary["formal_material_references"] = str(simplified_root)
@@ -885,11 +902,13 @@ def reset_material_references_to_approved_candidates(
     for folder in (keyframe_dir, clip_dir, report_dir):
         for stale_file in folder.iterdir():
             if stale_file.is_file():
-                stale_file.unlink()
+                try:
+                    stale_file.unlink()
+                except PermissionError:
+                    pass
 
     existing_index = ref_root / f"{MATERIAL_INDEX_BASENAME}.jsonl"
-    existing_rows = read_jsonl(existing_index) if merge_existing and existing_index.exists() else []
-    kept_rows = [row for row in existing_rows if row.get("asset_kind") == REPORT_DIR_NAME]
+    kept_rows: list[dict[str, Any]] = []
     promoted: list[dict[str, Any]] = []
     for row in approved_rows:
         source = _stored_path_from_row(row, candidate_root)
