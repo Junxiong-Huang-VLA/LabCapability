@@ -222,3 +222,42 @@ def test_promote_reviewed_release_requires_gate_eval_and_becomes_default(tmp_pat
     assert load_reviewed_export(session)["manifest"]["release"]["version"] == "v001"
     assert (session / "reviewed_releases" / "promoted_release.json").exists()
     assert (metadata / "promoted_release.json").exists()
+
+
+def test_failed_promotion_writes_candidate_artifacts_without_overwriting_defaults(tmp_path: Path) -> None:
+    session = tmp_path
+    metadata = session / "metadata"
+    segment = {
+        "segment_id": "seg_1",
+        "start_sec": 0.0,
+        "end_sec": 10.0,
+        "duration_sec": 10.0,
+        "boundary_confidence": 0.9,
+        "action_type": "weighing",
+        "primary_object": "balance",
+        "index_text": "balance weighing sample",
+        "keyframes": ["seg.jpg"],
+    }
+    write_jsonl(metadata / "key_action_segments.jsonl", [segment])
+    write_jsonl(metadata / "micro_segments.jsonl", [])
+    write_jsonl(metadata / "vector_metadata.jsonl", [{**segment, "index_level": "segment"}])
+    write_jsonl(metadata / "micro_vector_metadata.jsonl", [])
+    _build_source_index(session)
+    release = freeze_reviewed_dataset(session)
+    default_gate = metadata / "quality_gate.json"
+    default_eval = session / "evaluation" / "default_chinese_query_validation.json"
+    default_eval.parent.mkdir(parents=True)
+    default_gate.write_text(json.dumps({"status": "pass", "sentinel": "promoted_default"}), encoding="utf-8")
+    default_eval.write_text(json.dumps({"status": "pass", "sentinel": "promoted_default"}), encoding="utf-8")
+
+    try:
+        promote_reviewed_release(session, version=release["release"]["version"], reviewer="qa", query_count=2)
+    except ValueError as exc:
+        assert "reviewed release cannot be promoted" in str(exc)
+    else:
+        raise AssertionError("promotion should fail without fully human-verified gold benchmark")
+
+    assert json.loads(default_gate.read_text(encoding="utf-8"))["sentinel"] == "promoted_default"
+    assert json.loads(default_eval.read_text(encoding="utf-8"))["sentinel"] == "promoted_default"
+    assert (metadata / "quality_gate.v001.candidate.json").exists()
+    assert (session / "evaluation" / "default_chinese_query_validation.v001.candidate.json").exists()

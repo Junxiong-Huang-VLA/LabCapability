@@ -236,10 +236,16 @@ def promote_reviewed_release(
     from .quality_gate import build_quality_gate
     from .retrieval_eval import run_default_chinese_query_eval
 
+    release_version = str(release.get("version") or version or "candidate")
+    candidate_suffix = _safe_id(release_version)
+    candidate_gate_path = session / "metadata" / f"quality_gate.{candidate_suffix}.candidate.json"
+    candidate_eval_path = session / "evaluation" / f"default_chinese_query_validation.{candidate_suffix}.candidate.json"
+    default_gate_path = session / "metadata" / "quality_gate.json"
+    default_eval_path = session / "evaluation" / "default_chinese_query_validation.json"
     token = _ACTIVE_RELEASE_OVERRIDE.set(release)
     try:
-        gate = build_quality_gate(session)
-        evaluation = run_default_chinese_query_eval(session, query_count=query_count)
+        gate = build_quality_gate(session, output_path=candidate_gate_path)
+        evaluation = run_default_chinese_query_eval(session, output_path=candidate_eval_path, query_count=query_count)
     finally:
         _ACTIVE_RELEASE_OVERRIDE.reset(token)
     human_verified = int(evaluation.get("human_verified_query_count") or 0)
@@ -252,6 +258,11 @@ def promote_reviewed_release(
         failures.append({"gold_query_benchmark": "not_fully_human_verified", "human_verified_query_count": human_verified, "required": query_count})
     if failures:
         raise ValueError("reviewed release cannot be promoted: " + json.dumps(failures, ensure_ascii=False, default=str))
+
+    default_gate_path.parent.mkdir(parents=True, exist_ok=True)
+    default_eval_path.parent.mkdir(parents=True, exist_ok=True)
+    default_gate_path.write_text(json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8")
+    default_eval_path.write_text(json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8")
 
     promoted = {
         "schema_version": "key_action_promoted_reviewed_release.v1",
@@ -273,8 +284,10 @@ def promote_reviewed_release(
             "expected_id_hit_rate": evaluation.get("expected_id_hit_rate"),
         },
         "release": release,
-        "quality_gate_path": gate.get("gate_path"),
-        "retrieval_eval_path": str(session / "evaluation" / "default_chinese_query_validation.json"),
+        "quality_gate_path": str(default_gate_path),
+        "candidate_quality_gate_path": str(candidate_gate_path),
+        "retrieval_eval_path": str(default_eval_path),
+        "candidate_retrieval_eval_path": str(candidate_eval_path),
     }
     releases_dir = session / REVIEWED_RELEASES_DIRNAME
     releases_dir.mkdir(parents=True, exist_ok=True)
