@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from key_action_indexer.retrieval_eval import (
     FIXED_CHINESE_QUERY_BENCHMARK,
     build_default_chinese_query_eval_config,
     build_gold_query_benchmark,
+    confirm_gold_query_benchmark,
     run_default_chinese_query_eval,
 )
 from key_action_indexer.schemas import write_jsonl
@@ -83,3 +87,59 @@ def test_default_chinese_eval_writes_trend(tmp_path: Path) -> None:
     assert result["category_summary"]
     assert (session / "evaluation" / "retrieval_eval_trend.jsonl").exists()
     assert (session / "evaluation" / "retrieval_eval_trend.md").exists()
+
+
+def test_confirm_gold_query_benchmark_requires_human_decision_file(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    (session / "metadata").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="requires a human decision file"):
+        confirm_gold_query_benchmark(session, query_count=1)
+
+
+def test_confirm_gold_query_benchmark_locks_expected_ids_for_hard_metrics(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    row = {
+        "index_level": "micro_segment",
+        "segment_id": "seg_1",
+        "micro_segment_id": "micro_1",
+        "primary_object": "balance",
+        "detected_objects": ["balance", "sample"],
+        "action_type": "weighing",
+        "evidence_level": "visual_confirmed",
+        "index_text": "balance weighing sample keyframe",
+        "keyframes": ["peak.jpg"],
+    }
+    write_jsonl(metadata / "micro_segments.jsonl", [row])
+    write_jsonl(metadata / "micro_vector_metadata.jsonl", [row])
+    index = VectorIndex()
+    index.build([row["index_text"]], [row])
+    index.save(session / "index")
+
+    decisions = {
+        "decisions": [
+            {
+                "query_id": f"gold_cn_{index:03d}",
+                "decision": "approved",
+                "expected_segment_ids": ["seg_1"],
+                "expected_micro_segment_ids": ["micro_1"],
+                "expected_index_level": "micro_segment",
+                "reviewer": "tester",
+            }
+            for index in range(1, 4)
+        ]
+    }
+    decisions_path = metadata / "gold_query_decisions.json"
+    decisions_path.write_text(json.dumps(decisions), encoding="utf-8")
+
+    gold = confirm_gold_query_benchmark(session, query_count=3, reviewer="tester", decisions_path=decisions_path)
+    result = run_default_chinese_query_eval(session, query_count=3)
+
+    assert gold["human_verified_query_count"] == 3
+    assert all(query["human_verified"] is True for query in gold["queries"])
+    assert all(query["id_authoritative"] is True for query in gold["queries"])
+    assert result["human_verified_query_count"] == 3
+    assert result["expected_id_hit_rate"] == 1.0
+    assert result["top1_hit_rate"] == 1.0

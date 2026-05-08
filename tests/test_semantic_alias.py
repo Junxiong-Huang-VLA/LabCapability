@@ -27,6 +27,11 @@ def test_expand_query_maps_pipetting_alias() -> None:
     assert "tube" in expanded["target_objects"]
 
 
+def test_expand_query_separates_chinese_recording_and_sample_handling() -> None:
+    assert expand_query("\u67e5\u627e\u8bb0\u5f55\u8bfb\u6570\u7247\u6bb5")["canonical_action"] == "recording"
+    assert expand_query("\u67e5\u627e\u6837\u54c1\u5904\u7406\u7247\u6bb5")["canonical_action"] == "sample_handling"
+
+
 def test_infer_action_type_from_metadata_uses_visual_and_dialogue() -> None:
     assert infer_action_type_from_metadata({"primary_object": "balance"}) == "weighing"
     assert infer_action_type_from_metadata({"primary_object": "spatula"}) == "spatula_interaction"
@@ -46,4 +51,43 @@ def test_score_query_metadata_match_protects_pipetting_without_evidence() -> Non
     )
     assert result["rerank_score"] == 0.0
     assert "insufficient_pipette_or_dialogue_evidence" in result["rerank_reasons"]
+
+
+def test_score_query_metadata_match_prioritizes_distinct_semantic_targets() -> None:
+    sample = score_query_metadata_match(
+        "sample handling",
+        {
+            "index_level": "segment",
+            "primary_object": "reagent_bottle",
+            "action_type": "reagent_bottle_interaction",
+            "interaction_type": "hand_reagent_bottle_contact",
+            "detected_objects": ["reagent_bottle"],
+        },
+    )
+    paper = score_query_metadata_match(
+        "sample handling",
+        {
+            "index_level": "segment",
+            "primary_object": "paper",
+            "action_type": "hand_object_interaction",
+            "interaction_type": "hand_paper_contact",
+            "detected_objects": ["paper"],
+        },
+    )
+    recording = score_query_metadata_match(
+        "recording balance readout",
+        {
+            "index_level": "segment",
+            "primary_object": "paper",
+            "action_type": "hand_object_interaction",
+            "interaction_type": "hand_paper_contact",
+            "detected_objects": ["paper", "balance"],
+            "start_sec": 52.0,
+            "duration_sec": 12.0,
+        },
+    )
+
+    assert sample["rerank_score"] > paper["rerank_score"]
+    assert "sample_handling_object_priority" in sample["rerank_reasons"]
+    assert "recording_late_window_candidate" in recording["rerank_reasons"]
 

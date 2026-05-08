@@ -81,3 +81,4 @@ def test_recovery_review_packet_lists_candidates_and_decision_template(tmp_path:
     assert "keyframes/peak.jpg" in packet
     assert decisions["decisions"][0]["confirmation_id"] == "session_a:step_001"
     assert decisions["decisions"][0]["decision"] == ""
+    assert decisions["decision_allowed_values"] == ["approve", "reject", "needs_more_review"]

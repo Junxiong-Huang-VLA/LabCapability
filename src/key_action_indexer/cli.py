@@ -32,13 +32,14 @@ from .model_inventory import discover_lab_assets
 from .model_observations import build_model_observation_events
 from .pipeline import run_detection_only, run_pipeline
 from .process_reasoner import build_experiment_process
+from .promotion_readiness import build_promotion_readiness_report
 from .quality_gate import build_quality_gate
 from .query_validation import query_index, query_session_index, validate_queries
 from .report import generate_report
-from .retrieval_eval import build_default_chinese_query_eval_config, build_gold_query_benchmark, run_default_chinese_query_eval
+from .retrieval_eval import build_default_chinese_query_eval_config, build_gold_query_benchmark, confirm_gold_query_benchmark, run_default_chinese_query_eval
 from .review_bundle import apply_review_to_process, export_review_bundle
 from .review_packet import build_recovery_review_packet
-from .reviewed_dataset import freeze_reviewed_dataset, rollback_reviewed_release
+from .reviewed_dataset import freeze_reviewed_dataset, promote_reviewed_release, rollback_reviewed_release
 from .schemas import SessionManifest
 from .session_context_seed import seed_session_context
 from .session_audit import build_session_audit_report
@@ -174,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--output-json")
     audit_parser.add_argument("--output-md")
 
+    promotion_audit_parser = subparsers.add_parser("promotion-audit", help="Audit reviewed-release promotion readiness across sessions")
+    promotion_audit_parser.add_argument("--source", action="append", required=True)
+    promotion_audit_parser.add_argument("--query-count", type=int, default=50)
+    promotion_audit_parser.add_argument("--output-json")
+    promotion_audit_parser.add_argument("--output-md")
+
     health_parser = subparsers.add_parser("health", help="Build a no-label key-action run health report")
     health_parser.add_argument("--session-dir", required=True)
     health_parser.add_argument("--output-json")
@@ -202,6 +209,13 @@ def build_parser() -> argparse.ArgumentParser:
     rollback_reviewed_parser = subparsers.add_parser("rollback-reviewed-release", help="Rollback reviewed dataset to a previous reviewed release")
     rollback_reviewed_parser.add_argument("--session-dir", required=True)
     rollback_reviewed_parser.add_argument("--version")
+
+    promote_reviewed_parser = subparsers.add_parser("promote-reviewed-release", help="Promote a reviewed release for default retrieval/export")
+    promote_reviewed_parser.add_argument("--session-dir", required=True)
+    promote_reviewed_parser.add_argument("--version")
+    promote_reviewed_parser.add_argument("--reviewer", required=True)
+    promote_reviewed_parser.add_argument("--note", default="")
+    promote_reviewed_parser.add_argument("--query-count", type=int, default=50)
 
     quality_gate_parser = subparsers.add_parser("quality-gate", help="Build the key-action completion quality gate")
     quality_gate_parser.add_argument("--session-dir", required=True)
@@ -315,6 +329,14 @@ def build_parser() -> argparse.ArgumentParser:
     gold_query_parser.add_argument("--query-count", type=int, default=50)
     gold_query_parser.add_argument("--overwrite", action="store_true")
 
+    confirm_gold_parser = subparsers.add_parser("confirm-gold-query-benchmark", help="Mark the fixed Chinese gold benchmark as manually verified against reviewed release")
+    confirm_gold_parser.add_argument("--session-dir", required=True)
+    confirm_gold_parser.add_argument("--decisions", required=True, help="Human decision JSON/JSONL with query_id decisions and expected ids")
+    confirm_gold_parser.add_argument("--output")
+    confirm_gold_parser.add_argument("--query-count", type=int, default=50)
+    confirm_gold_parser.add_argument("--reviewer", default="manual_reviewer")
+    confirm_gold_parser.add_argument("--note", default="Human-verified against the current reviewed release.")
+
     report_parser = subparsers.add_parser("report", help="Generate validation report")
     report_parser.add_argument("--session-dir", required=True)
 
@@ -415,6 +437,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "audit-sessions":
         _print_json(build_session_audit_report(args.source, query_texts=args.query, output_json=args.output_json, output_md=args.output_md))
         return 0
+    if args.command == "promotion-audit":
+        _print_json(
+            build_promotion_readiness_report(
+                args.source,
+                query_count=args.query_count,
+                output_json=args.output_json,
+                output_md=args.output_md,
+            )
+        )
+        return 0
     if args.command == "health":
         report = build_run_health_report(
             args.session_dir,
@@ -450,6 +482,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "rollback-reviewed-release":
         _print_json(rollback_reviewed_release(args.session_dir, version=args.version))
+        return 0
+    if args.command == "promote-reviewed-release":
+        _print_json(
+            promote_reviewed_release(
+                args.session_dir,
+                version=args.version,
+                reviewer=args.reviewer,
+                note=args.note,
+                query_count=args.query_count,
+            )
+        )
         return 0
     if args.command == "quality-gate":
         result = build_quality_gate(args.session_dir, output_path=args.output)
@@ -624,6 +667,18 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=args.output,
                 query_count=args.query_count,
                 overwrite=args.overwrite,
+            )
+        )
+        return 0
+    if args.command == "confirm-gold-query-benchmark":
+        _print_json(
+            confirm_gold_query_benchmark(
+                args.session_dir,
+                decisions_path=args.decisions,
+                output_path=args.output,
+                query_count=args.query_count,
+                reviewer=args.reviewer,
+                note=args.note,
             )
         )
         return 0

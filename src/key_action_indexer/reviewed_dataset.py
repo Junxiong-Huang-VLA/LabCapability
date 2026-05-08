@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import contextvars
 import json
 import shutil
 import zipfile
@@ -23,7 +24,12 @@ REVIEWED_EVIDENCE_FILENAME = "reviewed_evidence.jsonl"
 REVIEWED_VECTOR_METADATA_FILENAME = "reviewed_vector_metadata.jsonl"
 REVIEWED_RELEASES_DIRNAME = "reviewed_releases"
 LATEST_REVIEWED_RELEASE_FILENAME = "latest_reviewed_release.json"
+PROMOTED_REVIEWED_RELEASE_FILENAME = "promoted_release.json"
 REVIEWED_RELEASE_MANIFEST_FILENAME = "reviewed_release_manifest.json"
+_ACTIVE_RELEASE_OVERRIDE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "key_action_active_reviewed_release_override",
+    default=None,
+)
 
 
 def freeze_reviewed_dataset(session_dir: str | Path, *, create_release: bool = True) -> dict[str, Any]:
@@ -154,6 +160,16 @@ def freeze_reviewed_dataset(session_dir: str | Path, *, create_release: bool = T
 
 def reviewed_index_dir(session_dir: str | Path) -> Path:
     session = Path(session_dir)
+    override = _ACTIVE_RELEASE_OVERRIDE.get()
+    if isinstance(override, Mapping):
+        override_index = Path(str(override.get("release_dir") or "")) / "reviewed_index"
+        if (override_index / "fallback_index.pkl").exists():
+            return override_index
+    promoted = _promoted_release_manifest(session)
+    if promoted:
+        promoted_index = Path(str(promoted.get("release_dir") or "")) / "reviewed_index"
+        if (promoted_index / "fallback_index.pkl").exists():
+            return promoted_index
     latest = _latest_release_manifest(session)
     if latest:
         release_index = Path(str(latest.get("release_dir") or "")) / "reviewed_index"
@@ -173,10 +189,15 @@ def reviewed_metadata_path(session_dir: str | Path, file_name: str) -> Path:
         "micro_segments.jsonl": REVIEWED_MICROS_FILENAME,
         "vector_metadata.jsonl": REVIEWED_VECTOR_METADATA_FILENAME,
         "micro_vector_metadata.jsonl": REVIEWED_VECTOR_METADATA_FILENAME,
+        REVIEWED_EXPORT_FILENAME: REVIEWED_EXPORT_FILENAME,
+        REVIEWED_MANIFEST_FILENAME: REVIEWED_MANIFEST_FILENAME,
     }.get(file_name)
+    override = _ACTIVE_RELEASE_OVERRIDE.get()
+    promoted = _promoted_release_manifest(session)
     latest = _latest_release_manifest(session)
-    if reviewed_name and latest:
-        candidate = Path(str(latest.get("release_dir") or "")) / "artifacts" / reviewed_name
+    active = override if isinstance(override, Mapping) else promoted or latest
+    if reviewed_name and active:
+        candidate = Path(str(active.get("release_dir") or "")) / "artifacts" / reviewed_name
         if candidate.exists():
             return candidate
     if reviewed_name and (metadata / reviewed_name).exists():
@@ -186,6 +207,82 @@ def reviewed_metadata_path(session_dir: str | Path, file_name: str) -> Path:
 
 def latest_reviewed_release(session_dir: str | Path) -> dict[str, Any] | None:
     return _latest_release_manifest(Path(session_dir))
+
+
+def active_reviewed_release(session_dir: str | Path) -> dict[str, Any] | None:
+    session = Path(session_dir)
+    override = _ACTIVE_RELEASE_OVERRIDE.get()
+    if isinstance(override, Mapping):
+        return dict(override)
+    return _promoted_release_manifest(session) or _latest_release_manifest(session)
+
+
+def promote_reviewed_release(
+    session_dir: str | Path,
+    *,
+    version: str | None = None,
+    reviewer: str = "manual_reviewer",
+    note: str = "",
+    query_count: int = 50,
+) -> dict[str, Any]:
+    session = Path(session_dir)
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        raise ValueError("reviewer is required to promote a reviewed release")
+    release = _release_manifest_for(session, version)
+    if not release:
+        raise ValueError("reviewed release not found")
+
+    from .quality_gate import build_quality_gate
+    from .retrieval_eval import run_default_chinese_query_eval
+
+    token = _ACTIVE_RELEASE_OVERRIDE.set(release)
+    try:
+        gate = build_quality_gate(session)
+        evaluation = run_default_chinese_query_eval(session, query_count=query_count)
+    finally:
+        _ACTIVE_RELEASE_OVERRIDE.reset(token)
+    human_verified = int(evaluation.get("human_verified_query_count") or 0)
+    failures: list[dict[str, Any]] = []
+    if gate.get("status") != "pass" or not gate.get("can_mark_complete"):
+        failures.append({"gate": gate.get("status"), "blocking_checks": gate.get("blocking_checks")})
+    if evaluation.get("status") != "pass":
+        failures.append({"retrieval_eval": evaluation.get("status"), "threshold_failures": evaluation.get("threshold_failures")})
+    if human_verified < query_count:
+        failures.append({"gold_query_benchmark": "not_fully_human_verified", "human_verified_query_count": human_verified, "required": query_count})
+    if failures:
+        raise ValueError("reviewed release cannot be promoted: " + json.dumps(failures, ensure_ascii=False, default=str))
+
+    promoted = {
+        "schema_version": "key_action_promoted_reviewed_release.v1",
+        "promoted_at": _now(),
+        "active_version": release.get("version"),
+        "release_dir": release.get("release_dir"),
+        "reviewer": reviewer,
+        "approval_note": note or "Approved for retrieval/export default.",
+        "promotion_requirements": {
+            "quality_gate_status": gate.get("status"),
+            "quality_gate_blocking_count": (gate.get("summary") or {}).get("blocking_count"),
+            "retrieval_eval_status": evaluation.get("status"),
+            "gold_benchmark_binding_mode": evaluation.get("benchmark_binding_mode"),
+            "gold_benchmark_path": evaluation.get("gold_benchmark_path"),
+            "human_verified_query_count": human_verified,
+            "query_count": evaluation.get("query_count"),
+            "top1_hit_rate": evaluation.get("top1_hit_rate"),
+            "top3_hit_rate": evaluation.get("topk_hit_rate"),
+            "expected_id_hit_rate": evaluation.get("expected_id_hit_rate"),
+        },
+        "release": release,
+        "quality_gate_path": gate.get("gate_path"),
+        "retrieval_eval_path": str(session / "evaluation" / "default_chinese_query_validation.json"),
+    }
+    releases_dir = session / REVIEWED_RELEASES_DIRNAME
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    (releases_dir / PROMOTED_REVIEWED_RELEASE_FILENAME).write_text(json.dumps(promoted, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True, exist_ok=True)
+    (metadata / PROMOTED_REVIEWED_RELEASE_FILENAME).write_text(json.dumps(promoted, ensure_ascii=False, indent=2), encoding="utf-8")
+    return promoted
 
 
 def rollback_reviewed_release(session_dir: str | Path, version: str | None = None) -> dict[str, Any]:
@@ -235,9 +332,10 @@ def rollback_reviewed_release(session_dir: str | Path, version: str | None = Non
 
 def load_reviewed_export(session_dir: str | Path) -> dict[str, Any]:
     session = Path(session_dir)
-    path = session / "metadata" / REVIEWED_EXPORT_FILENAME
+    path = reviewed_metadata_path(session, REVIEWED_EXPORT_FILENAME)
     if not path.exists():
         freeze_reviewed_dataset(session, create_release=False)
+        path = session / "metadata" / REVIEWED_EXPORT_FILENAME
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
@@ -353,12 +451,17 @@ def _segment_from_micro_window(
     segment["segment_id"] = reviewed_segment_id
     segment["source_segment_id"] = parent_id
     segment["reviewed_from_micro_segment_id"] = micro.get("micro_segment_id")
+    segment["micro_segment_id"] = micro.get("micro_segment_id")
     segment["convergence_source"] = "micro_window"
     start, end = _row_interval(micro)
     if start is not None:
         segment["start_sec"] = start
     if end is not None:
         segment["end_sec"] = end
+    if micro.get("global_start_time"):
+        segment["global_start_time"] = micro.get("global_start_time")
+    if micro.get("global_end_time"):
+        segment["global_end_time"] = micro.get("global_end_time")
     if start is not None and end is not None and end >= start:
         segment["duration_sec"] = round(end - start, 4)
     for key in (
@@ -381,9 +484,18 @@ def _segment_from_micro_window(
         "third_person_clip",
         "clip_path",
         "preview_path",
+        "text_description",
+        "index",
+        "visual_keywords",
+        "yolo_labels",
     ):
-        if micro.get(key) not in (None, "", []):
-            segment[key] = copy.deepcopy(micro.get(key))
+        value = _micro_metadata_value(micro, key)
+        if value not in (None, "", []):
+            segment[key] = copy.deepcopy(value)
+    micro_index_text = _index_text(micro)
+    if micro_index_text:
+        segment["index_text"] = micro_index_text
+        segment["index"] = {"index_level": "segment", "index_text": micro_index_text}
     confidence = _row_confidence(micro) or _row_confidence(source_segment) or 0.75
     segment["boundary_confidence"] = confidence
     segment["confidence"] = confidence
@@ -407,6 +519,51 @@ def _segment_from_micro_window(
                 view["local_end_sec"] = end
     _append_review_index_text(segment)
     return segment
+
+
+def _micro_metadata_value(micro: Mapping[str, Any], key: str) -> Any:
+    if micro.get(key) not in (None, "", []):
+        return micro.get(key)
+    interaction = micro.get("interaction") if isinstance(micro.get("interaction"), Mapping) else {}
+    text_description = micro.get("text_description") if isinstance(micro.get("text_description"), Mapping) else {}
+    evidence = micro.get("evidence") if isinstance(micro.get("evidence"), Mapping) else {}
+    if key in {"primary_object", "primary_object_family", "detected_objects", "interaction_type"}:
+        return interaction.get(key)
+    if key == "action_type":
+        return text_description.get("action_type") or interaction.get("action_type")
+    if key in {"evidence_level", "evidence_reasons", "coverage_signal_grade"}:
+        return evidence.get(key)
+    if key == "visual_keywords":
+        values = []
+        values.extend(str(item) for item in _as_list(interaction.get("detected_objects")) if item)
+        if interaction.get("primary_object"):
+            values.append(str(interaction["primary_object"]))
+        if interaction.get("interaction_type"):
+            values.append(str(interaction["interaction_type"]))
+        return _ordered_unique(values)
+    return None
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
 
 
 def _ensure_auto_review(row: dict[str, Any], *, item_id: str) -> None:
@@ -482,6 +639,18 @@ def _timeline_metrics(
 
 
 def _source_extent(source_segments: list[Mapping[str, Any]], reviewed_micros: list[Mapping[str, Any]]) -> float | None:
+    explicit_extents: list[float] = []
+    for row in [*source_segments, *reviewed_micros]:
+        for key in ("source_video_duration_sec", "session_duration_sec", "video_duration_sec", "timeline_extent_sec"):
+            try:
+                value = float(row.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                explicit_extents.append(value)
+    if explicit_extents:
+        return round(max(explicit_extents), 4)
+
     intervals = []
     for row in [*source_segments, *reviewed_micros]:
         start, end = _row_interval(row)
@@ -599,6 +768,49 @@ def _latest_release_manifest(session: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _promoted_release_manifest(session: Path) -> dict[str, Any] | None:
+    for pointer in (
+        session / REVIEWED_RELEASES_DIRNAME / PROMOTED_REVIEWED_RELEASE_FILENAME,
+        session / "metadata" / PROMOTED_REVIEWED_RELEASE_FILENAME,
+    ):
+        if not pointer.exists():
+            continue
+        try:
+            data = json.loads(pointer.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        requirements = data.get("promotion_requirements") if isinstance(data.get("promotion_requirements"), Mapping) else {}
+        if requirements.get("gold_benchmark_binding_mode") != "human_verified_review_file":
+            continue
+        release_dir = Path(str(data.get("release_dir") or ""))
+        manifest = release_dir / REVIEWED_RELEASE_MANIFEST_FILENAME
+        if not manifest.exists():
+            continue
+        try:
+            release = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(release, dict):
+            release["promotion"] = dict(data)
+            return release
+    return None
+
+
+def _release_manifest_for(session: Path, version: str | None) -> dict[str, Any] | None:
+    if version:
+        path = session / REVIEWED_RELEASES_DIRNAME / version / REVIEWED_RELEASE_MANIFEST_FILENAME
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+    return _latest_release_manifest(session)
 
 
 def _next_release_version(releases_dir: Path) -> str:
@@ -768,7 +980,7 @@ def _append_review_index_text(row: dict[str, Any]) -> None:
     if not isinstance(index, dict):
         index = {}
         row["index"] = index
-    text = str(index.get("index_text") or row.get("index_text") or row.get("text") or "")
+    text = _index_text(row)
     review = row.get("review") if isinstance(row.get("review"), Mapping) else {}
     suffix = f"\nreview_status: {row.get('review_status') or 'pending'}"
     if review.get("boundary_adjusted"):
@@ -842,17 +1054,32 @@ def _build_reviewed_index(session: Path, rows: list[Mapping[str, Any]]) -> Path:
 def _index_text(row: Mapping[str, Any]) -> str:
     index = row.get("index") if isinstance(row.get("index"), Mapping) else {}
     text_description = row.get("text_description") if isinstance(row.get("text_description"), Mapping) else {}
-    return str(
-        row.get("index_text")
-        or index.get("index_text")
-        or text_description.get("index_text")
-        or text_description.get("summary")
-        or row.get("summary")
-        or row.get("title")
-        or row.get("segment_id")
-        or row.get("micro_segment_id")
-        or ""
+    candidates = (
+        row.get("index_text"),
+        index.get("index_text"),
+        text_description.get("index_text"),
+        text_description.get("summary"),
+        row.get("summary"),
+        row.get("title"),
+        row.get("segment_id"),
+        row.get("micro_segment_id"),
+        "",
     )
+    fallback = ""
+    for candidate in candidates:
+        text = str(candidate or "")
+        if not text:
+            continue
+        if not fallback:
+            fallback = text
+        if not _review_only_index_text(text):
+            return text
+    return fallback
+
+
+def _review_only_index_text(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith("review_status:") for line in lines)
 
 
 def _rejected_ids(decisions: Mapping[str, Mapping[str, Any]], prefix: str) -> set[str]:
@@ -979,13 +1206,16 @@ __all__ = [
     "REVIEWED_EXPORT_FILENAME",
     "REVIEWED_MANIFEST_FILENAME",
     "REVIEWED_MICROS_FILENAME",
+    "PROMOTED_REVIEWED_RELEASE_FILENAME",
     "REVIEWED_RELEASE_MANIFEST_FILENAME",
     "REVIEWED_RELEASES_DIRNAME",
     "REVIEWED_SEGMENTS_FILENAME",
     "REVIEWED_VECTOR_METADATA_FILENAME",
+    "active_reviewed_release",
     "freeze_reviewed_dataset",
     "latest_reviewed_release",
     "load_reviewed_export",
+    "promote_reviewed_release",
     "rollback_reviewed_release",
     "reviewed_index_dir",
     "reviewed_metadata_path",

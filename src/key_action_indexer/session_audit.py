@@ -54,11 +54,45 @@ def render_session_audit_markdown(report: Mapping[str, Any]) -> str:
         f"- Total strong micro evidence: `{summary.get('strong_process_micro_count')}`",
         f"- Total retrieval-only micro evidence: `{summary.get('retrieval_candidate_micro_count')}`",
         "",
-        "## Session Metrics",
+        "## Final Acceptance Table",
         "",
-        "| Session | Segments | Micro | Strong | Retrieval-only | Video events | Candidate ratio | Rollup | QA | Health | Queue | Risks |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---|",
+        "| Session | QA | Health | Candidate ratio | Strong | Retrieval-only | Segment backfill promoted | Chinese queries | Dual-view traceability | Query semantic diversity |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    for row in report.get("sessions") or []:
+        if not isinstance(row, Mapping):
+            continue
+        metrics = _as_dict(row.get("metrics"))
+        micro = _as_dict(metrics.get("micro_evidence"))
+        video = _as_dict(metrics.get("video_understanding"))
+        qa = _as_dict(metrics.get("quality"))
+        health = _as_dict(metrics.get("health"))
+        query = _as_dict(metrics.get("query_smoke"))
+        diversity = _as_dict(query.get("semantic_diversity"))
+        query_count = int(diversity.get("query_count") or 0)
+        dual_view_count = int(query.get("dual_view_traceable_top_count") or 0)
+        lines.append(
+            "| "
+            f"`{row.get('session_id')}` | "
+            f"`{qa.get('overall_status', 'missing')}` | "
+            f"`{health.get('gate_status', 'missing')}` | "
+            f"{video.get('candidate_ratio', 0.0)} | "
+            f"{micro.get('strong_process_evidence', 0)} | "
+            f"{micro.get('retrieval_candidate', 0)} | "
+            f"{micro.get('segment_level_backfill_promoted_count', 0)} | "
+            f"{query.get('chinese_query_count', 0)} | "
+            f"{dual_view_count}/{query_count} | "
+            f"{diversity.get('distinct_top_result_ratio', 0.0)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Session Metrics",
+            "",
+            "| Session | Segments | Micro | Strong | Retrieval-only | Video events | Candidate ratio | Rollup | QA | Health | Queue | Risks |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---|",
+        ]
+    )
     for row in report.get("sessions") or []:
         if not isinstance(row, Mapping):
             continue
@@ -84,7 +118,7 @@ def render_session_audit_markdown(report: Mapping[str, Any]) -> str:
             f"`{health.get('gate_status', 'missing')}` | "
             f"{confirmation.get('pending_count', 0)} | "
             f"{risk_count} |"
-        )
+            )
     lines.extend(["", "## Risks", ""])
     for row in report.get("sessions") or []:
         if not isinstance(row, Mapping):
@@ -123,6 +157,31 @@ def render_session_audit_markdown(report: Mapping[str, Any]) -> str:
                 f"`{item.get('top_dual_view_clip_traceable')}` | "
                 f"{item.get('top_keyframe_count', 0)} |"
             )
+    lines.extend(
+        [
+            "",
+            "## Query Semantic Diversity",
+            "",
+            "| Session | Queries | Distinct Top Results | Max Top Reuse | Diversity Ratio | Most Reused Top Result |",
+            "|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in report.get("sessions") or []:
+        if not isinstance(row, Mapping):
+            continue
+        query = _as_dict(_as_dict(row.get("metrics")).get("query_smoke"))
+        diversity = _as_dict(query.get("semantic_diversity"))
+        if not diversity:
+            continue
+        lines.append(
+            "| "
+            f"`{row.get('session_id')}` | "
+            f"{diversity.get('query_count', 0)} | "
+            f"{diversity.get('distinct_top_result_count', 0)} | "
+            f"{diversity.get('max_top_result_reuse_count', 0)} | "
+            f"{diversity.get('distinct_top_result_ratio', 0.0)} | "
+            f"`{diversity.get('most_reused_top_result_id') or ''}` |"
+        )
     lines.extend(
         [
             "",
@@ -196,6 +255,9 @@ def _audit_session(session: Path, *, query_texts: list[str]) -> dict[str, Any]:
             "session_count": history.get("session_count"),
             "event_count": history.get("event_count"),
             "source_session_ids": history.get("source_session_ids") or [],
+            "key_action_index_session_count": history.get("key_action_index_session_count"),
+            "legacy_source_count": history.get("legacy_source_count"),
+            "step_reasoning_support": history.get("step_reasoning_support") or {},
         },
         "query_smoke": _query_smoke(session, query_texts),
     }
@@ -318,7 +380,17 @@ def _query_smoke(session: Path, query_texts: list[str]) -> dict[str, Any]:
                 "top_keyframe_count": keyframe_count,
             }
         )
-    return {"configured": True, "queries": rows}
+    semantic_diversity = _query_semantic_diversity(rows)
+    return {
+        "configured": True,
+        "query_count": len(rows),
+        "chinese_query_count": sum(1 for row in rows if _has_non_ascii(row.get("query"))),
+        "english_query_count": sum(1 for row in rows if not _has_non_ascii(row.get("query"))),
+        "traceable_top_count": sum(1 for row in rows if row.get("top_traceable")),
+        "dual_view_traceable_top_count": sum(1 for row in rows if row.get("top_dual_view_clip_traceable")),
+        "semantic_diversity": semantic_diversity,
+        "queries": rows,
+    }
 
 
 def _risks(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -339,8 +411,22 @@ def _risks(row: Mapping[str, Any]) -> list[dict[str, Any]]:
         risks.append({"code": "candidate_ratio_above_target", "message": f"Candidate ratio {ratio} is above the 0.30 target."})
     if int(micro.get("strong_process_evidence") or 0) == 0:
         risks.append({"code": "no_strong_micro_evidence", "message": "No micro-segments are eligible as strong process evidence."})
-    if int(history.get("session_count") or 0) < 6:
-        risks.append({"code": "history_under_sampled", "message": "History model has fewer than 6 sessions."})
+    key_action_history_count = int(history.get("key_action_index_session_count") or 0)
+    reasoning = _as_dict(history.get("step_reasoning_support"))
+    if key_action_history_count < 3:
+        risks.append(
+            {
+                "code": "history_key_action_under_sampled",
+                "message": "History model has fewer than 3 complete key_action_index sources.",
+            }
+        )
+    if int(reasoning.get("history_record_count") or 0) < 3 or not reasoning.get("has_transition_priors"):
+        risks.append(
+            {
+                "code": "history_step_reasoning_weak",
+                "message": "History model lacks enough process records or transition priors for step reasoning.",
+            }
+        )
     if int(micro.get("segment_level_backfill_promoted_count") or 0) > 0:
         risks.append(
             {
@@ -353,9 +439,46 @@ def _risks(row: Mapping[str, Any]) -> list[dict[str, Any]]:
             risks.append({"code": "query_no_results", "message": f"Query returned no results: {item.get('query')}"})
         elif not item.get("top_traceable"):
             risks.append({"code": "query_top_not_traceable", "message": f"Top query result lacks clip/keyframe traceability: {item.get('query')}"})
+    diversity = _as_dict(query.get("semantic_diversity"))
+    if (
+        int(diversity.get("query_count") or 0) >= 4
+        and float(diversity.get("distinct_top_result_ratio") or 0.0) < 0.5
+    ):
+        risks.append(
+            {
+                "code": "query_semantic_concentration",
+                "message": (
+                    "Expanded retrieval acceptance queries are concentrated on too few top results "
+                    f"({diversity.get('distinct_top_result_count')}/{diversity.get('query_count')})."
+                ),
+            }
+        )
     if query.get("error"):
         risks.append({"code": "query_smoke_error", "message": str(query.get("error"))})
     return risks
+
+
+def _query_semantic_diversity(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    top_ids = [str(row.get("top_result_id") or "") for row in rows if row.get("top_result_id")]
+    counts = Counter(top_ids)
+    query_count = len(rows)
+    distinct = len(counts)
+    most_reused_id = ""
+    most_reused_count = 0
+    if counts:
+        most_reused_id, most_reused_count = counts.most_common(1)[0]
+    return {
+        "query_count": query_count,
+        "distinct_top_result_count": distinct,
+        "distinct_top_result_ratio": round(distinct / query_count, 6) if query_count else 0.0,
+        "max_top_result_reuse_count": most_reused_count,
+        "most_reused_top_result_id": most_reused_id,
+        "top_result_counts": dict(sorted(counts.items())),
+    }
+
+
+def _has_non_ascii(value: Any) -> bool:
+    return any(ord(char) > 127 for char in str(value or ""))
 
 
 def _traceable(result: Mapping[str, Any]) -> bool:

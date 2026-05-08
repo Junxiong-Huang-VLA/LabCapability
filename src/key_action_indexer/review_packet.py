@@ -58,9 +58,15 @@ def build_recovery_review_packet(
             "generated_at": generated_at,
             "instructions": [
                 "Inspect candidate clips and keyframes before editing decisions.",
-                "Set decision to approved, rejected, or needs_review.",
+                "Set decision to approve, reject, or needs_more_review.",
                 "Run confirmation-batch only after a human reviewer has filled reviewer and note fields.",
             ],
+            "decision_allowed_values": ["approve", "reject", "needs_more_review"],
+            "decision_normalization": {
+                "approve": "approved",
+                "reject": "rejected",
+                "needs_more_review": "needs_review",
+            },
             "decisions": decision_rows,
         }
         decision_path.write_text(json.dumps(decision_payload, ensure_ascii=False, indent=2), encoding="utf-8")

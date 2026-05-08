@@ -34,6 +34,7 @@ def build_history_model(
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     source_list = [Path(source) for source in sources]
+    source_quality = [_source_quality(source) for source in source_list]
     events = _load_history_events(source_list)
     history_records = _load_history_process_records(source_list)
     sessions: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -71,6 +72,15 @@ def build_history_model(
         "version": 2,
         "created_at": _now(),
         "source_session_ids": sorted(sessions),
+        "source_quality": source_quality,
+        "source_quality_counts": dict(sorted(Counter(str(row.get("source_kind") or "unknown") for row in source_quality).items())),
+        "key_action_index_session_count": sum(1 for row in source_quality if row.get("is_complete_key_action_index")),
+        "legacy_source_count": sum(1 for row in source_quality if not row.get("is_complete_key_action_index")),
+        "step_reasoning_support": {
+            "history_record_count": len(history_records),
+            "sources_with_process_records": sum(1 for row in source_quality if row.get("has_experiment_process")),
+            "has_transition_priors": bool(transition_counts),
+        },
         "audit_trail": [
             _audit_entry(
                 "history_model_built",
@@ -389,6 +399,46 @@ def _load_history_events(sources: Iterable[str | Path]) -> list[dict[str, Any]]:
         else:
             events.extend(_normalize_rows(_read_history_json_rows(source), source.stem))
     return events
+
+
+def _source_quality(source: Path) -> dict[str, Any]:
+    metadata = source / "metadata" if source.is_dir() else source.parent
+    if source.is_dir() and not metadata.exists() and (source / "key_action_index" / "metadata").exists():
+        metadata = source / "key_action_index" / "metadata"
+    has_key_action_index = metadata.name == "metadata" and metadata.parent.name == "key_action_index"
+    source_session_id = _source_quality_session_id(source, metadata)
+    has_process = (metadata / "experiment_process.json").exists()
+    has_timeline = (metadata / "experiment_process_timeline.jsonl").exists()
+    has_micro = (metadata / "micro_segments.jsonl").exists()
+    has_video = (metadata / "video_understanding.jsonl").exists()
+    complete = bool(has_key_action_index and has_process and has_timeline and has_micro and has_video)
+    if complete:
+        source_kind = "complete_key_action_index"
+    elif has_key_action_index:
+        source_kind = "partial_key_action_index"
+    else:
+        source_kind = "legacy_or_external"
+    return {
+        "source": str(source),
+        "source_session_id": source_session_id,
+        "source_kind": source_kind,
+        "is_complete_key_action_index": complete,
+        "has_key_action_index": has_key_action_index,
+        "has_experiment_process": has_process,
+        "has_process_timeline": has_timeline,
+        "has_micro_segments": has_micro,
+        "has_video_understanding": has_video,
+    }
+
+
+def _source_quality_session_id(source: Path, metadata: Path) -> str:
+    if metadata.name == "metadata" and metadata.parent.name == "key_action_index":
+        return metadata.parent.parent.name
+    if source.name == "metadata" and source.parent.name == "key_action_index":
+        return source.parent.parent.name
+    if source.name == "key_action_index":
+        return source.parent.name
+    return source.stem if source.is_file() else source.name
 
 
 def _read_history_jsonl_rows(path: Path) -> list[dict[str, Any]]:

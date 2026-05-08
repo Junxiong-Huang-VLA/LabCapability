@@ -337,9 +337,13 @@ def _semantic_adapter_issue_items(
             start = None
             end = None
             coverage = adapter.get("coverage") if isinstance(adapter.get("coverage"), Mapping) else {}
+            details = issue.get("details") if isinstance(issue.get("details"), Mapping) else {}
+            relation = details.get("relation") if isinstance(details.get("relation"), Mapping) else {}
+            start = _float(relation.get("start_sec"))
+            end = _float(relation.get("end_sec"))
             if row is None:
-                start = _float(coverage.get("start_sec"))
-                end = _float(coverage.get("end_sec"))
+                start = start if start is not None else _float(coverage.get("start_sec"))
+                end = end if end is not None else _float(coverage.get("end_sec"))
             item = {
                 "item_id": item_id,
                 "item_type": "evidence_semantic",
@@ -348,13 +352,17 @@ def _semantic_adapter_issue_items(
                 "summary": issue.get("message") or code,
                 "severity": issue.get("severity") or "warning",
                 "review_status": "pending",
+                "segment_id": relation.get("segment_id"),
+                "micro_segment_id": relation.get("micro_segment_id"),
                 "start_sec": start,
                 "end_sec": end,
                 "duration_sec": (end - start) if start is not None and end is not None and end >= start else None,
-                "reasons": [code],
+                "reasons": [value for value in (code, issue.get("semantic_category")) if value],
                 "payload": {
                     "adapter": adapter_name,
                     "issue": dict(issue),
+                    "semantic_category": issue.get("semantic_category"),
+                    "relation": dict(relation),
                     "adapter_status": adapter.get("status"),
                     "coverage": dict(coverage),
                 },

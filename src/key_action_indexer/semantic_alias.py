@@ -6,6 +6,8 @@ HAND_TOUCH_BOTTLE = "\u624b\u78b0\u74f6\u5b50"
 WEIGHING = "\u79f0\u91cf"
 USE_SPATULA = "\u4f7f\u7528\u522e\u52fa"
 PIPETTING_ZH = "\u52a0\u6837"
+SAMPLE_HANDLING = "sample_handling"
+RECORDING = "recording"
 
 
 ACTION_ALIASES: dict[str, dict[str, list[str]]] = {
@@ -33,6 +35,16 @@ ACTION_ALIASES: dict[str, dict[str, list[str]]] = {
         "objects": ["pipette", "pipette_tip", "tube", "reagent_bottle", "bottle", "sample_bottle", "sample_bottle_blue"],
         "interaction_types": ["pipetting", "sample_adding", "hand_pipette_contact", "hand_pipette_tip_contact"],
         "keywords": ["\u52a0\u6837", "\u79fb\u6db2", "\u79fb\u6db2\u67aa", "\u5fae\u5347", "\u52a0\u5165", "\u6ef4\u52a0"],
+    },
+    SAMPLE_HANDLING: {
+        "objects": ["sample_bottle", "sample_bottle_blue", "reagent_bottle", "spatula", "paper", "bottle"],
+        "interaction_types": ["hand_object_contact", "hand_sample_bottle_contact", "hand_reagent_bottle_contact", "hand_spatula_contact", "hand_paper_contact"],
+        "keywords": ["sample", "sample handling", "sample bottle", "spatula", "weighing paper", "\u6837\u54c1", "\u6837\u54c1\u5904\u7406", "\u53d6\u6837", "\u6837\u54c1\u74f6"],
+    },
+    RECORDING: {
+        "objects": ["balance", "paper", "display", "notebook"],
+        "interaction_types": ["recording", "panel_reading", "hand_paper_contact"],
+        "keywords": ["recording", "record", "readout", "balance readout", "reading", "\u8bb0\u5f55", "\u8bfb\u6570", "\u5929\u5e73\u8bfb\u6570"],
     },
 }
 
@@ -109,6 +121,15 @@ def _as_text_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _query_payload(text: str, canonical: str, objects: list[str], interactions: list[str], keywords: list[str]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "canonical_action": canonical,
@@ -125,6 +146,46 @@ def _query_payload(text: str, canonical: str, objects: list[str], interactions: 
 def expand_query(query_text: str) -> dict[str, Any]:
     text = str(query_text or "")
     lower = text.lower()
+    if "\u8bb0\u5f55" in text or ("\u8bfb\u6570" in text and "\u79f0\u91cf" not in text):
+        return _query_payload(
+            text,
+            RECORDING,
+            ["balance", "paper", "display", "notebook"],
+            ["recording", "panel_reading", "hand_paper_contact"],
+            ["recording", "record", "readout", "balance readout", "reading", "\u8bb0\u5f55", "\u8bfb\u6570", "\u5929\u5e73\u8bfb\u6570"],
+        )
+    if "\u6837\u54c1\u5904\u7406" in text or ("\u6837\u54c1" in text and "\u79fb\u6db2" not in text and "\u52a0\u6837" not in text):
+        return _query_payload(
+            text,
+            SAMPLE_HANDLING,
+            ["sample_bottle", "sample_bottle_blue", "reagent_bottle", "spatula", "paper", "bottle"],
+            ["hand_object_contact", "hand_sample_bottle_contact", "hand_reagent_bottle_contact", "hand_spatula_contact", "hand_paper_contact"],
+            ["sample handling", "sample", "sample bottle", "spatula", "weighing paper", "\u6837\u54c1", "\u6837\u54c1\u5904\u7406", "\u53d6\u6837", "\u6837\u54c1\u74f6"],
+        )
+    if "\u79fb\u6db2" in text or "\u52a0\u6837" in text:
+        return _query_payload(
+            text,
+            "pipetting",
+            ["pipette", "pipette_tip", "tube", "reagent_bottle", "bottle", "sample_bottle", "sample_bottle_blue"],
+            ["pipetting", "sample_adding", "hand_pipette_contact", "hand_pipette_tip_contact"],
+            ["pipetting", "pipette", "liquid transfer", "sample adding", "\u79fb\u6db2", "\u52a0\u6837", "\u6ef4\u52a0"],
+        )
+    if "\u79f0\u91cf" in text or "\u5929\u5e73" in text:
+        return _query_payload(
+            text,
+            "weighing",
+            ["balance", "paper", "weighing_paper", "sample_bottle", "spatula"],
+            ["weighing", "hand_balance_contact", "hand_paper_contact", "spatula_sampling"],
+            ["weighing", "balance", "weighing paper", "sample mass", "\u79f0\u91cf", "\u5929\u5e73", "\u91cd\u91cf"],
+        )
+    if any(token in lower for token in ["balance weighing", "weighing", "weigh"]):
+        return _query_payload(
+            text,
+            "weighing",
+            ["balance", "paper", "weighing_paper", "sample_bottle", "spatula"],
+            ["weighing", "hand_balance_contact", "hand_paper_contact", "spatula_sampling"],
+            ["weighing", "balance", "weighing paper", "sample mass"],
+        )
     if any(token in lower for token in ["pipette", "pipetting", "liquid transfer"]):
         return _query_payload(
             text,
@@ -132,6 +193,22 @@ def expand_query(query_text: str) -> dict[str, Any]:
             ["pipette", "pipette_tip", "tube", "reagent_bottle", "bottle", "sample_bottle", "sample_bottle_blue"],
             ["pipetting", "sample_adding", "hand_pipette_contact", "hand_pipette_tip_contact"],
             ["pipetting", "pipette", "liquid transfer", "sample adding"],
+        )
+    if "sample handling" in lower or ("sample" in lower and "handling" in lower):
+        return _query_payload(
+            text,
+            SAMPLE_HANDLING,
+            ["sample_bottle", "sample_bottle_blue", "reagent_bottle", "spatula", "paper", "bottle"],
+            ["hand_object_contact", "hand_sample_bottle_contact", "hand_reagent_bottle_contact", "hand_spatula_contact", "hand_paper_contact"],
+            ["sample handling", "sample", "sample bottle", "spatula", "weighing paper"],
+        )
+    if "recording" in lower or "readout" in lower or ("record" in lower and "balance" in lower):
+        return _query_payload(
+            text,
+            RECORDING,
+            ["balance", "paper", "display", "notebook"],
+            ["recording", "panel_reading", "hand_paper_contact"],
+            ["recording", "record", "readout", "balance readout", "reading"],
         )
     if "reagent bottle" in lower or ("bottle" in lower and ("touch" in lower or "contact" in lower or "open" in lower)):
         return _query_payload(
@@ -188,6 +265,8 @@ def score_query_metadata_match(query_text: str, metadata: dict[str, Any]) -> dic
     related_dialogue = " ".join(_as_text_list(metadata.get("related_dialogue")))
     detected = {_norm(item) for item in _as_text_list(metadata.get("detected_objects"))}
     tools = {_norm(item) for item in _as_text_list(metadata.get("tools"))}
+    start_sec = _as_float(metadata.get("start_sec"))
+    duration_sec = _as_float(metadata.get("duration_sec"))
     class_threshold = metadata.get("class_threshold") if isinstance(metadata.get("class_threshold"), dict) else {}
     query_boost = float(class_threshold.get("query_boost", 1.0) or 1.0)
     score = 0.0
@@ -198,7 +277,7 @@ def score_query_metadata_match(query_text: str, metadata: dict[str, Any]) -> dic
     sample_adding_objects = {"pipette", "pipette_tip", "tube"}
     has_pipette_evidence = bool({primary, *tools} & sample_adding_objects) or any(
         label in interaction_type for label in sample_adding_objects
-    )
+    ) or bool(detected & sample_adding_objects)
     if canonical in {PIPETTING_ZH, "pipetting"} and not has_pipette_evidence and not has_dialogue_keyword and not has_index_keyword:
         if metadata.get("index_level") == "segment":
             score += 0.08
@@ -233,6 +312,27 @@ def score_query_metadata_match(query_text: str, metadata: dict[str, Any]) -> dic
     if canonical in {action_type, inferred_action} and canonical:
         score += 0.12
         reasons.append(f"alias_overlap:{canonical}")
+    if canonical == "weighing" and (primary == "spatula" or interaction_type == "hand_spatula_contact" or action_type == "spatula_interaction"):
+        score += 0.24
+        reasons.append("weighing_spatula_sample_transfer_candidate")
+    if canonical == SAMPLE_HANDLING and action_type in {"spatula_interaction", "bottle_interaction", "reagent_bottle_interaction", "hand_object_interaction"}:
+        score += 0.10
+        reasons.append("sample_handling_action_family")
+    if canonical == SAMPLE_HANDLING and primary in {"reagent_bottle", "sample_bottle", "sample_bottle_blue", "spatula", "bottle"}:
+        score += 0.12
+        reasons.append("sample_handling_object_priority")
+    if canonical == SAMPLE_HANDLING and primary == "paper":
+        score -= 0.04
+        reasons.append("sample_handling_deprioritize_paper_surface")
+    if canonical == RECORDING and primary == "paper":
+        score += 0.08
+        reasons.append("recording_surface_candidate")
+    if canonical == RECORDING and duration_sec is not None and duration_sec >= 8.0:
+        score += 0.08
+        reasons.append("recording_sustained_surface_window")
+    if canonical == RECORDING and start_sec is not None and start_sec >= 45.0:
+        score += 0.05
+        reasons.append("recording_late_window_candidate")
     if has_dialogue_keyword:
         score += 0.12
         reasons.append("matched_dialogue_keyword")

@@ -50,6 +50,8 @@ def test_history_learning_builds_transition_and_duration_model(tmp_path: Path) -
     assert scored["history_deviation"]["rare_transition_count"] == 1
     assert model["schema_version"] == "key_action_history_model.v2"
     assert model["history_record_count"] == 0
+    assert model["key_action_index_session_count"] == 0
+    assert model["legacy_source_count"] == 2
     assert model["audit_trail"]
 
 
@@ -74,6 +76,7 @@ def test_history_learning_reads_legacy_labsopguard_event_dirs(tmp_path: Path) ->
 
     assert model["session_count"] == 1
     assert model["source_session_ids"] == ["legacy_session"]
+    assert model["source_quality_counts"] == {"legacy_or_external": 1}
     assert model["action_counts"]["liquid_transfer"] == 1
     assert model["duration_stats"]["liquid_transfer"]["median_sec"] == 3
 
@@ -117,3 +120,18 @@ def test_history_records_preserve_version_source_and_audit_trail(tmp_path: Path)
     assert records[-1]["audit_trail"][0]["action"] == "manual_update"
     assert similar[0]["source_session_id"] == "source_session_1"
     assert similar[0]["score"] > 0.8
+
+
+def test_history_source_quality_names_key_action_parent_session(tmp_path: Path) -> None:
+    session = tmp_path / "real_session_id" / "key_action_index"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    (metadata / "experiment_process.json").write_text(json.dumps({"session_id": "real_session_id"}), encoding="utf-8")
+    write_jsonl(metadata / "experiment_process_timeline.jsonl", [])
+    write_jsonl(metadata / "micro_segments.jsonl", [])
+    write_jsonl(metadata / "video_understanding.jsonl", [])
+
+    model = build_history_model([session])
+
+    assert model["source_quality"][0]["source_session_id"] == "real_session_id"
+    assert model["key_action_index_session_count"] == 1

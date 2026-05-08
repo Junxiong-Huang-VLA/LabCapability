@@ -58,3 +58,43 @@ def test_review_queue_collects_quality_segment_micro_and_material_items(tmp_path
     updated = build_review_queue(tmp_path)
     approved = [item for item in updated["items"] if item["item_id"] == "micro:micro_1"][0]
     assert approved["review_status"] == "approved"
+
+
+def test_review_queue_links_semantic_adapter_failures_to_timeline_target(tmp_path: Path) -> None:
+    metadata = tmp_path / "metadata"
+    cv_outputs = tmp_path / "cv_outputs"
+    (tmp_path / "index").mkdir(parents=True)
+    (tmp_path / "index" / "fallback_index.pkl").write_bytes(b"index")
+    cv_outputs.mkdir(parents=True)
+    segment = {
+        "segment_id": "seg_1",
+        "start_sec": 0.0,
+        "end_sec": 10.0,
+        "duration_sec": 10.0,
+        "boundary_confidence": 0.9,
+        "boundary_source": "yolo_physical_evidence",
+        "action_type": "weighing",
+        "primary_object": "balance",
+    }
+    write_jsonl(cv_outputs / "detected_segments.jsonl", [segment])
+    write_jsonl(metadata / "key_action_segments.jsonl", [segment])
+    write_jsonl(metadata / "micro_segments.jsonl", [])
+    write_jsonl(metadata / "vector_metadata.jsonl", [{"segment_id": "seg_1", "index_text": "balance weighing"}])
+    write_jsonl(metadata / "micro_vector_metadata.jsonl", [])
+    write_jsonl(metadata / "object_tracks.jsonl", [])
+    write_jsonl(
+        metadata / "panel_ocr.jsonl",
+        [{"session_id": "sess_1", "view": "first_person", "start_sec": 1.0, "end_sec": 2.0, "equipment_label": "balance", "state": "visible"}],
+    )
+    write_jsonl(metadata / "liquid_state.jsonl", [])
+    write_jsonl(metadata / "container_state.jsonl", [])
+
+    queue = build_review_queue(tmp_path)
+
+    semantic_items = [item for item in queue["items"] if item["item_type"] == "evidence_semantic"]
+    assert semantic_items
+    item = semantic_items[0]
+    assert item["segment_id"] == "seg_1"
+    assert item["start_sec"] == 1.0
+    assert item["end_sec"] == 2.0
+    assert item["payload"]["semantic_category"] == "missing_fields"

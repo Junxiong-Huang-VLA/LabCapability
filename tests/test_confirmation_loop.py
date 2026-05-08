@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from key_action_indexer.confirmation_loop import (
+    apply_confirmation_batch_decisions,
     apply_confirmation_decision,
     build_confirmation_queue,
     build_confirmation_review_summary,
@@ -358,3 +359,50 @@ def test_confirmation_queue_replays_existing_decisions_into_process(tmp_path: Pa
     assert updated["steps"][0]["requires_human_confirmation"] is False
     assert updated["steps"][0]["confirmation_decision"]["reviewer"] == "qa"
     assert updated["pending_confirmation_step_ids"] == []
+
+
+def test_confirmation_batch_accepts_review_decision_aliases(tmp_path: Path) -> None:
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    process_path = metadata / "experiment_process.json"
+    process_path.write_text(
+        json.dumps(
+            {
+                "session_id": "alias_session",
+                "steps": [
+                    {
+                        "step_id": "step_001",
+                        "name": "Check sample",
+                        "status": "not_observed",
+                        "completed": False,
+                        "requires_human_confirmation": True,
+                        "confirmation_status": "pending",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    decisions = tmp_path / "decisions.json"
+    decisions.write_text(
+        json.dumps(
+            {
+                "decisions": [
+                    {
+                        "confirmation_id": "alias_session:step_001",
+                        "decision": "needs_more_review",
+                        "reviewer": "qa",
+                        "note": "needs another visual pass",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = apply_confirmation_batch_decisions(tmp_path, decisions)
+    updated = json.loads(process_path.read_text(encoding="utf-8"))
+
+    assert result["applied_count"] == 1
+    assert result["decision_counts"] == {"needs_review": 1}
+    assert updated["steps"][0]["confirmation_status"] == "needs_review"

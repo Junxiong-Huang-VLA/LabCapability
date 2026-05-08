@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from .evidence_adapter_validation import validate_evidence_adapters
 from .health_report import build_run_health_report
-from .reviewed_dataset import REVIEWED_MANIFEST_FILENAME, REVIEWED_VECTOR_METADATA_FILENAME, latest_reviewed_release, reviewed_metadata_path
+from .reviewed_dataset import REVIEWED_MANIFEST_FILENAME, REVIEWED_VECTOR_METADATA_FILENAME, active_reviewed_release, reviewed_metadata_path
 from .schemas import read_jsonl
 
 
@@ -167,6 +167,7 @@ def build_quality_gate(
             "adapter_validation_error_count": adapter_error_count,
             "adapter_semantic_issue_count": adapter_semantic_issue_count,
             "reviewed_release": reviewed_manifest.get("release", {}).get("version") if isinstance(reviewed_manifest.get("release"), Mapping) else None,
+            "promoted_release": reviewed_manifest.get("promotion", {}).get("active_version") if isinstance(reviewed_manifest.get("promotion"), Mapping) else None,
         },
         "checks": checks,
         "blocking_checks": blocking,
@@ -198,12 +199,14 @@ def _low_confidence_segment_count(session: Path) -> int:
 
 
 def _active_reviewed_manifest(session: Path) -> dict[str, Any]:
-    latest = latest_reviewed_release(session)
-    if isinstance(latest, Mapping):
-        release_dir = Path(str(latest.get("release_dir") or ""))
+    active = active_reviewed_release(session)
+    if isinstance(active, Mapping):
+        release_dir = Path(str(active.get("release_dir") or ""))
         candidate = release_dir / "artifacts" / REVIEWED_MANIFEST_FILENAME
         data = _read_json(candidate)
         if data:
+            if isinstance(active.get("promotion"), Mapping):
+                data["promotion"] = dict(active["promotion"])
             return data
     return _read_json(session / "metadata" / REVIEWED_MANIFEST_FILENAME)
 

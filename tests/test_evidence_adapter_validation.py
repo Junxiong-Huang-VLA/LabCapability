@@ -22,6 +22,8 @@ def _base_session(session: Path) -> None:
                 "end_sec": 10.0,
                 "duration_sec": 10.0,
                 "boundary_confidence": 0.9,
+                "action_type": "weighing",
+                "primary_object": "balance",
             }
         ],
     )
@@ -85,5 +87,74 @@ def test_validate_evidence_adapters_reports_semantic_support_issues(tmp_path: Pa
 
     panel = result["adapters"]["panel_ocr"]
     assert panel["semantic_issue_count"] == 1
+    assert panel["semantic_summary"]["missing_fields"] == 1
     assert result["summary"]["semantic_issue_count"] == 1
-    assert any(issue["code"] == "semantic_support_missing" for issue in panel["issues"])
+    assert any(issue["code"] == "semantic_missing_fields" for issue in panel["issues"])
+
+
+def test_validate_evidence_adapters_accepts_nested_measurement_semantics(tmp_path: Path) -> None:
+    _base_session(tmp_path)
+    metadata = tmp_path / "metadata"
+    write_jsonl(metadata / "object_tracks.jsonl", [])
+    write_jsonl(
+        metadata / "panel_ocr.jsonl",
+        [
+            {
+                "session_id": "sess_1",
+                "view": "first_person",
+                "start_sec": 1.0,
+                "end_sec": 2.0,
+                "measurement": {"equipment_label": "balance", "display_text": "0.124 g"},
+            }
+        ],
+    )
+    write_jsonl(metadata / "liquid_state.jsonl", [])
+    write_jsonl(metadata / "container_state.jsonl", [])
+
+    result = validate_evidence_adapters(tmp_path)
+
+    assert result["adapters"]["panel_ocr"]["semantic_issue_count"] == 0
+    assert result["adapters"]["panel_ocr"]["linked_segment_ids"] == ["seg_1"]
+
+
+def test_validate_evidence_adapters_classifies_time_and_action_semantic_failures(tmp_path: Path) -> None:
+    _base_session(tmp_path)
+    metadata = tmp_path / "metadata"
+    write_jsonl(metadata / "object_tracks.jsonl", [])
+    write_jsonl(metadata / "panel_ocr.jsonl", [])
+    write_jsonl(
+        metadata / "liquid_state.jsonl",
+        [
+            {
+                "session_id": "sess_1",
+                "view": "first_person",
+                "start_sec": 11.0,
+                "end_sec": 11.2,
+                "measurement": {"container_label": "tube", "liquid_state": "meniscus_visible"},
+            }
+        ],
+    )
+    write_jsonl(
+        metadata / "container_state.jsonl",
+        [
+            {
+                "session_id": "sess_1",
+                "view": "first_person",
+                "start_sec": 1.0,
+                "end_sec": 2.0,
+                "container_label": "tube",
+                "state": "open",
+                "action_type": "open",
+                "confirmation_level": "confirmed",
+            }
+        ],
+    )
+
+    result = validate_evidence_adapters(tmp_path)
+
+    liquid = result["adapters"]["liquid_state"]
+    container = result["adapters"]["container_state"]
+    assert liquid["semantic_summary"]["time_mismatch"] == 1
+    assert container["semantic_summary"]["action_mismatch"] == 1
+    assert any(issue["semantic_category"] == "time_mismatch" for issue in liquid["issues"])
+    assert any(issue["semantic_category"] == "action_mismatch" for issue in container["issues"])

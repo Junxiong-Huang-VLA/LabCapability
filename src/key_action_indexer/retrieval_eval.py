@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -78,8 +79,9 @@ def build_default_chinese_query_eval_config(
     session = Path(session_dir)
     metadata = session / "metadata"
     target = Path(output_path) if output_path is not None else metadata / "default_chinese_query_validation.json"
-    gold = build_gold_query_benchmark(session, query_count=DEFAULT_QUERY_COUNT)
-    rules = list(gold.get("queries") or [])[: max(1, min(query_count, len(FIXED_CHINESE_QUERY_BENCHMARK)))]
+    selected_count = max(1, min(query_count, len(FIXED_CHINESE_QUERY_BENCHMARK)))
+    gold = build_gold_query_benchmark(session, query_count=selected_count)
+    rules = list(gold.get("queries") or [])[:selected_count]
     config = {
         "schema_version": "key_action_query_validation.v3",
         "acceptance_name": "fixed_50_chinese_key_action_retrieval_eval",
@@ -87,6 +89,7 @@ def build_default_chinese_query_eval_config(
         "gold_benchmark_path": str(metadata / GOLD_QUERY_BENCHMARK_FILENAME),
         "benchmark_binding_mode": gold.get("binding_mode"),
         "human_verified_query_count": gold.get("human_verified_query_count"),
+        "id_authoritative": bool(gold.get("id_authoritative")),
         "thresholds": {
             "min_acceptance_hit_rate": 0.4,
             "min_topk_hit_rate": 0.4,
@@ -152,9 +155,104 @@ def build_gold_query_benchmark(
         "query_count": len(rules),
         "human_verified_query_count": sum(1 for rule in rules if rule.get("human_verified")),
         "binding_mode": "bootstrap_pending_human_verification",
+        "id_authoritative": False,
         "note": "Expected segment/micro ids are human GT slots. bootstrap_auto bindings are only initial anchors until human_verified=true.",
         "categories": dict(sorted(categories.items())),
         "queries": rules,
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload["benchmark_path"] = str(target)
+    return payload
+
+
+def confirm_gold_query_benchmark(
+    session_dir: str | Path,
+    *,
+    reviewer: str = "manual_reviewer",
+    note: str = "Human-verified against the current reviewed release.",
+    decisions_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    query_count: int = DEFAULT_QUERY_COUNT,
+) -> dict[str, Any]:
+    if decisions_path is None:
+        raise ValueError("confirm-gold-query-benchmark requires a human decision file; refusing to auto-mark human_verified=true")
+    session = Path(session_dir)
+    target = Path(output_path) if output_path is not None else session / "metadata" / GOLD_QUERY_BENCHMARK_FILENAME
+    gold = build_gold_query_benchmark(session, output_path=target, query_count=query_count)
+    queries = [dict(row) for row in gold.get("queries") or []][: max(1, min(query_count, DEFAULT_QUERY_COUNT))]
+    decisions = _gold_query_decisions_by_id(Path(decisions_path))
+    now = _now()
+    confirmed = []
+    unresolved = []
+    for row in queries:
+        query_id = str(row.get("query_id") or "")
+        decision = decisions.get(query_id) or decisions.get(str(row.get("query") or ""))
+        if not decision:
+            row["human_verified"] = False
+            row["manual_review_status"] = "needs_human_verification"
+            row["verification_note"] = "No human decision row was provided for this query."
+            unresolved.append(query_id or row.get("query"))
+            confirmed.append(row)
+            continue
+        status = _normalize_gold_decision(decision.get("decision") or decision.get("status"))
+        if status != "approved":
+            row["human_verified"] = False
+            row["manual_review_status"] = "rejected" if status == "rejected" else "needs_more_review"
+            row["verification_note"] = decision.get("note") or note
+            row["verified_by"] = decision.get("reviewer") or reviewer
+            row["verified_at"] = now
+            unresolved.append(query_id or row.get("query"))
+            confirmed.append(row)
+            continue
+        segment_ids = _string_list(decision.get("expected_segment_ids") or decision.get("segment_ids") or decision.get("segment_id"))
+        micro_ids = _string_list(decision.get("expected_micro_segment_ids") or decision.get("micro_segment_ids") or decision.get("micro_segment_id"))
+        if not segment_ids and not micro_ids:
+            row["human_verified"] = False
+            row["manual_review_status"] = "needs_more_review"
+            row["verification_note"] = "Approved decision is missing expected segment or micro ids."
+            row["verified_by"] = decision.get("reviewer") or reviewer
+            row["verified_at"] = now
+            unresolved.append(query_id or row.get("query"))
+            confirmed.append(row)
+            continue
+        if segment_ids:
+            row["expected_segment_ids"] = segment_ids
+        if micro_ids:
+            row["expected_micro_segment_ids"] = micro_ids
+        elif "expected_micro_segment_ids" in row:
+            row.pop("expected_micro_segment_ids", None)
+        if decision.get("expected_index_level"):
+            row["expected_index_level"] = str(decision["expected_index_level"])
+        if isinstance(decision.get("expected_time_window"), Mapping):
+            row["expected_time_window"] = dict(decision["expected_time_window"])
+        row["human_verified"] = True
+        row["manual_review_status"] = "approved"
+        row["binding_source"] = "human_confirmed_decision_file"
+        row["id_authoritative"] = True
+        row["verified_by"] = decision.get("reviewer") or reviewer
+        row["verified_at"] = now
+        row["verification_note"] = decision.get("note") or note
+        confirmed.append(row)
+    categories = Counter(str(rule.get("benchmark_category") or "uncategorized") for rule in confirmed)
+    human_verified_count = sum(1 for rule in confirmed if rule.get("human_verified"))
+    fully_verified = human_verified_count == len(confirmed)
+    payload = {
+        **{key: value for key, value in gold.items() if key not in {"queries", "categories", "human_verified_query_count", "binding_mode", "id_authoritative"}},
+        "schema_version": "key_action_gold_query_benchmark.v1",
+        "benchmark_version": "2026-05-08.fixed50.human_review_file",
+        "session_dir": str(session),
+        "query_count": len(confirmed),
+        "human_verified_query_count": human_verified_count,
+        "binding_mode": "human_verified_review_file" if fully_verified else "partial_human_verified_review_file",
+        "id_authoritative": fully_verified,
+        "verified_by": reviewer,
+        "verified_at": now,
+        "manual_review_status": "approved" if fully_verified else "partial",
+        "unresolved_query_ids": unresolved,
+        "source_decisions_path": str(decisions_path),
+        "categories": dict(sorted(categories.items())),
+        "queries": confirmed,
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -345,6 +443,49 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return read_jsonl(path) if path.exists() else []
 
 
+def _gold_query_decisions_by_id(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"gold query decision file not found: {path}")
+    if path.suffix.lower() in {".jsonl", ".ndjson"}:
+        rows = read_jsonl(path)
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        rows = payload.get("decisions") if isinstance(payload, Mapping) else payload
+    if not isinstance(rows, list):
+        raise ValueError("gold query decision file must be a list or contain a decisions list")
+    decisions: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = str(row.get("query_id") or row.get("query") or "").strip()
+        if key:
+            decisions[key] = dict(row)
+    return decisions
+
+
+def _normalize_gold_decision(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "approve": "approved",
+        "approved": "approved",
+        "reject": "rejected",
+        "rejected": "rejected",
+        "needs_more_review": "needs_review",
+        "needs-review": "needs_review",
+        "needs_review": "needs_review",
+    }
+    if text not in aliases:
+        raise ValueError("gold query decision must be one of: approve, reject, needs_more_review")
+    return aliases[text]
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    values = value if isinstance(value, list) else [value]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
 def _first_text(row: Mapping[str, Any], *keys: str) -> str:
     for key in keys:
         value = row.get(key)
@@ -357,6 +498,10 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 __all__ = [
     "DEFAULT_QUERY_COUNT",
     "FIXED_CHINESE_QUERY_BENCHMARK",
@@ -364,6 +509,7 @@ __all__ = [
     "TREND_JSONL_FILENAME",
     "TREND_MD_FILENAME",
     "build_default_chinese_query_eval_config",
+    "confirm_gold_query_benchmark",
     "build_gold_query_benchmark",
     "run_default_chinese_query_eval",
 ]

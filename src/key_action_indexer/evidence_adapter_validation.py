@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from .health_report import build_run_health_report
 from .model_observations import MODEL_INPUT_FILE_ALIASES
+from .schemas import read_jsonl
 
 
 ADAPTER_VALIDATION_SCHEMA_VERSION = "key_action_evidence_adapter_validation.v1"
@@ -43,6 +44,7 @@ def validate_evidence_adapters(session_dir: str | Path, output_path: str | Path 
     metrics = health.get("metrics") if isinstance(health.get("metrics"), Mapping) else {}
     duration_sec = _float(metrics.get("video_duration_sec"))
     manifest_session_id = _manifest_session_id(session)
+    context = _validation_context(metadata)
 
     adapters: dict[str, Any] = {}
     for adapter_name, spec in CANONICAL_ADAPTERS.items():
@@ -52,6 +54,7 @@ def validate_evidence_adapters(session_dir: str | Path, output_path: str | Path 
             spec,
             duration_sec=duration_sec,
             manifest_session_id=manifest_session_id,
+            context=context,
         )
 
     totals = {
@@ -89,6 +92,7 @@ def _validate_adapter(
     *,
     duration_sec: float | None,
     manifest_session_id: str,
+    context: Mapping[str, Any],
 ) -> dict[str, Any]:
     source_type = str(spec["source_type"])
     aliases = list(MODEL_INPUT_FILE_ALIASES.get(source_type, (spec["canonical_file"],)))
@@ -115,9 +119,22 @@ def _validate_adapter(
     views: set[str] = set()
     session_ids: set[str] = set()
     valid_rows = 0
+    semantic_summary = {"missing_fields": 0, "time_mismatch": 0, "action_mismatch": 0}
+    linked_segments: set[str] = set()
+    linked_micros: set[str] = set()
     for row_index, row in enumerate(rows, start=1):
         row_issues = _validate_row(adapter_name, row, spec, row_index, duration_sec, manifest_session_id)
-        row_issues.extend(_semantic_support_issues(adapter_name, row, row_index))
+        semantic = _semantic_support_issues(adapter_name, row, row_index, context=context)
+        row_issues.extend(semantic)
+        for issue in semantic:
+            category = str(issue.get("semantic_category") or "")
+            if category in semantic_summary:
+                semantic_summary[category] += 1
+        relation = _row_relation(row, context)
+        if relation.get("segment_id"):
+            linked_segments.add(str(relation["segment_id"]))
+        if relation.get("micro_segment_id"):
+            linked_micros.add(str(relation["micro_segment_id"]))
         issues.extend(row_issues)
         if not any(issue["severity"] == "error" for issue in row_issues):
             valid_rows += 1
@@ -154,6 +171,7 @@ def _validate_adapter(
         "error_count": error_count,
         "warning_count": warning_count,
         "semantic_issue_count": semantic_issue_count,
+        "semantic_summary": semantic_summary,
         "supported_action_types": _supported_action_types(adapter_name),
         "status": "fail" if error_count else "warning" if warning_count or not present_paths else "pass",
         "coverage": {
@@ -165,6 +183,8 @@ def _validate_adapter(
         "views": sorted(views),
         "session_ids": sorted(session_ids),
         "line_error_count": line_errors,
+        "linked_segment_ids": sorted(linked_segments),
+        "linked_micro_segment_ids": sorted(linked_micros),
         "issues": issues[:80],
     }
 
@@ -217,23 +237,56 @@ def _validate_row(
     return issues
 
 
-def _semantic_support_issues(adapter_name: str, row: Mapping[str, Any], row_index: int) -> list[dict[str, Any]]:
+def _semantic_support_issues(
+    adapter_name: str,
+    row: Mapping[str, Any],
+    row_index: int,
+    *,
+    context: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    relation = _row_relation(row, context)
     support = _semantic_support(adapter_name, row)
-    if support["supported"]:
-        return []
-    return [
-        _issue(
-            "warning",
-            "semantic_support_missing",
-            f"{adapter_name} row {row_index} is structurally valid but does not expose evidence fields for {', '.join(_supported_action_types(adapter_name))}",
-            row=row_index,
-            details={
-                "adapter": adapter_name,
-                "supported_action_types": _supported_action_types(adapter_name),
-                "missing_semantic_fields": support["missing_fields"],
-            },
+    if not support["supported"]:
+        issues.append(
+            _issue(
+                "warning",
+                "semantic_missing_fields",
+                f"{adapter_name} row {row_index} is structurally valid but lacks semantic evidence fields for {', '.join(_supported_action_types(adapter_name))}",
+                row=row_index,
+                details={
+                    "adapter": adapter_name,
+                    "supported_action_types": _supported_action_types(adapter_name),
+                    "missing_semantic_fields": support["missing_fields"],
+                    "relation": relation,
+                },
+                semantic_category="missing_fields",
+            )
         )
-    ]
+    if not relation.get("time_overlap_ok"):
+        issues.append(
+            _issue(
+                "warning",
+                "semantic_time_mismatch",
+                f"{adapter_name} row {row_index} does not overlap a known segment or micro time window",
+                row=row_index,
+                details={"adapter": adapter_name, "relation": relation},
+                semantic_category="time_mismatch",
+            )
+        )
+    mismatch = _semantic_action_mismatch(adapter_name, row, relation)
+    if mismatch:
+        issues.append(
+            _issue(
+                "warning",
+                "semantic_action_mismatch",
+                f"{adapter_name} row {row_index} does not match the linked action/object labels",
+                row=row_index,
+                details={"adapter": adapter_name, "relation": relation, **mismatch},
+                semantic_category="action_mismatch",
+            )
+        )
+    return issues
 
 
 def _semantic_support(adapter_name: str, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -244,11 +297,49 @@ def _semantic_support(adapter_name: str, row: Mapping[str, Any]) -> dict[str, An
         ]
     elif adapter_name == "panel_ocr":
         groups = [
-            ("readout/control state", ("display_text", "ocr_text", "readout", "reading", "value", "button_state", "knob_state", "switch_state", "control_state")),
+            (
+                "readout/control/interaction state",
+                (
+                    "display_text",
+                    "ocr_text",
+                    "readout",
+                    "reading",
+                    "value",
+                    "button_state",
+                    "button_pressed",
+                    "knob_state",
+                    "knob_angle_deg",
+                    "switch_state",
+                    "control_state",
+                    "panel_state",
+                    "interaction_score",
+                    "interaction",
+                    "candidate_type",
+                ),
+            ),
         ]
     elif adapter_name == "liquid_state":
         groups = [
-            ("liquid level/flow", ("liquid_level_y_norm", "meniscus_y_norm", "level_y_norm", "liquid_area_px", "mask_area_px", "volume_ml", "volume_ul", "flow_direction", "stream_width_px", "mask_path", "liquid_state")),
+            (
+                "liquid level/flow/transfer geometry",
+                (
+                    "liquid_level_y_norm",
+                    "meniscus_y_norm",
+                    "level_y_norm",
+                    "liquid_area_px",
+                    "mask_area_px",
+                    "volume_ml",
+                    "volume_ul",
+                    "flow_direction",
+                    "stream_width_px",
+                    "mask_path",
+                    "liquid_state",
+                    "tool_label",
+                    "container_label",
+                    "tool_container_distance_px",
+                    "candidate_type",
+                ),
+            ),
         ]
     elif adapter_name == "container_state":
         groups = [
@@ -311,6 +402,146 @@ def _row_time_window(row: Mapping[str, Any]) -> tuple[float | None, float | None
     return start, end
 
 
+def _validation_context(metadata: Path) -> dict[str, Any]:
+    raw_segments = _read_jsonl_if_exists(metadata / "key_action_segments.jsonl")
+    raw_micros = _read_jsonl_if_exists(metadata / "micro_segments.jsonl")
+    reviewed_segments = _read_jsonl_if_exists(metadata / "reviewed_segments.jsonl")
+    reviewed_micros = _read_jsonl_if_exists(metadata / "reviewed_micro_segments.jsonl")
+    segments = [*raw_segments, *reviewed_segments]
+    micros = [*raw_micros, *reviewed_micros]
+    return {
+        "segments": segments,
+        "micros": micros,
+        "segments_by_id": {str(row.get("segment_id") or ""): row for row in segments if row.get("segment_id")},
+        "micros_by_id": {str(row.get("micro_segment_id") or ""): row for row in micros if row.get("micro_segment_id")},
+    }
+
+
+def _row_relation(row: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+    start, end = _row_time_window(row)
+    segment_id = str(row.get("segment_id") or "")
+    micro_id = str(row.get("micro_segment_id") or "")
+    segments_by_id = context.get("segments_by_id") if isinstance(context.get("segments_by_id"), Mapping) else {}
+    micros_by_id = context.get("micros_by_id") if isinstance(context.get("micros_by_id"), Mapping) else {}
+    linked_micro = micros_by_id.get(micro_id) if micro_id else None
+    linked_segment = segments_by_id.get(segment_id) if segment_id else None
+    if not isinstance(linked_micro, Mapping):
+        linked_micro = _best_overlap(row, context.get("micros") if isinstance(context.get("micros"), list) else [])
+    if not isinstance(linked_segment, Mapping):
+        linked_segment = _best_overlap(row, context.get("segments") if isinstance(context.get("segments"), list) else [])
+    if isinstance(linked_micro, Mapping):
+        micro_id = str(linked_micro.get("micro_segment_id") or micro_id)
+        segment_id = str(linked_micro.get("parent_segment_id") or linked_micro.get("segment_id") or segment_id)
+    elif isinstance(linked_segment, Mapping):
+        segment_id = str(linked_segment.get("segment_id") or segment_id)
+    related = linked_micro if isinstance(linked_micro, Mapping) else linked_segment if isinstance(linked_segment, Mapping) else {}
+    overlap = _interval_overlap((start, end), _row_time_window(related)) if isinstance(related, Mapping) else 0.0
+    return {
+        "segment_id": segment_id or None,
+        "micro_segment_id": micro_id or None,
+        "start_sec": start,
+        "end_sec": end,
+        "linked_start_sec": _row_time_window(related)[0] if isinstance(related, Mapping) else None,
+        "linked_end_sec": _row_time_window(related)[1] if isinstance(related, Mapping) else None,
+        "time_overlap_sec": round(overlap, 4),
+        "time_overlap_ok": bool(overlap > 0.0 or (start is None and end is None)),
+        "linked_action_type": _first_text(related, "action_type", "interaction_type") if isinstance(related, Mapping) else "",
+        "linked_objects": sorted(_object_terms(related)) if isinstance(related, Mapping) else [],
+    }
+
+
+def _best_overlap(row: Mapping[str, Any], candidates: list[Any]) -> Mapping[str, Any] | None:
+    row_interval = _row_time_window(row)
+    best: tuple[float, Mapping[str, Any]] | None = None
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        overlap = _interval_overlap(row_interval, _row_time_window(candidate))
+        if overlap <= 0:
+            continue
+        if best is None or overlap > best[0]:
+            best = (overlap, candidate)
+    return best[1] if best else None
+
+
+def _interval_overlap(left: tuple[float | None, float | None], right: tuple[float | None, float | None]) -> float:
+    left_start, left_end = left
+    right_start, right_end = right
+    if left_start is None or left_end is None or right_start is None or right_end is None:
+        return 0.0
+    return max(0.0, min(left_end, right_end) - max(left_start, right_start))
+
+
+def _semantic_action_mismatch(adapter_name: str, row: Mapping[str, Any], relation: Mapping[str, Any]) -> dict[str, Any] | None:
+    linked_action = _norm(relation.get("linked_action_type"))
+    linked_objects = {_norm(item) for item in relation.get("linked_objects") or []}
+    row_action = _norm(_first_text(row, "action_type", "interaction_type", "event_type", "observation_type"))
+    row_objects = _object_terms(row)
+    expected_family = _adapter_action_family(adapter_name, row)
+    if row_action and expected_family and not _action_family_matches(row_action, expected_family):
+        return {"mismatch_type": "adapter_event_type", "row_action": row_action, "expected_family": sorted(expected_family)}
+    if linked_action and expected_family and not _action_family_matches(linked_action, expected_family) and _requires_strict_action_match(adapter_name, row):
+        return {"mismatch_type": "linked_action_type", "linked_action": linked_action, "expected_family": sorted(expected_family)}
+    if linked_objects and row_objects and linked_objects.isdisjoint(row_objects) and _requires_strict_object_match(adapter_name, row):
+        return {"mismatch_type": "object_label", "row_objects": sorted(row_objects), "linked_objects": sorted(linked_objects)}
+    return None
+
+
+def _adapter_action_family(adapter_name: str, row: Mapping[str, Any]) -> set[str]:
+    text = _row_text(row)
+    if adapter_name == "object_tracks":
+        return {"object", "motion", "hand", "track", "interaction"}
+    if adapter_name == "panel_ocr":
+        if any(token in text for token in ("ocr", "readout", "reading", "display", "panel", "control", "button", "knob", "switch", "equipment")):
+            return {"panel", "readout", "recording", "control", "equipment", "interaction"}
+    if adapter_name == "liquid_state":
+        if any(token in text for token in ("liquid", "flow", "transfer", "pipette", "meniscus", "volume", "stream")):
+            return {"liquid", "flow", "transfer", "pipetting"}
+    if adapter_name == "container_state":
+        return {"container", "open", "close", "cap", "lid", "color", "level"}
+    return set()
+
+
+def _action_family_matches(value: str, families: set[str]) -> bool:
+    value = _norm(value)
+    return any(family and family in value for family in families)
+
+
+def _requires_strict_action_match(adapter_name: str, row: Mapping[str, Any]) -> bool:
+    confirmation = _norm(row.get("confirmation_level"))
+    explicit = _first_text(row, "action_type", "interaction_type")
+    return bool(explicit and confirmation in {"confirmed", "measured", "trusted"})
+
+
+def _requires_strict_object_match(adapter_name: str, row: Mapping[str, Any]) -> bool:
+    return adapter_name in {"container_state"} and _norm(row.get("confirmation_level")) in {"confirmed", "measured", "trusted"}
+
+
+def _object_terms(row: Mapping[str, Any]) -> set[str]:
+    terms = {
+        _norm(_first_text(row, "object_label", "label", "class_name", "object_name", "container_label", "equipment_label", "target_object")),
+    }
+    measurement = row.get("measurement") if isinstance(row.get("measurement"), Mapping) else {}
+    for key in ("object_label", "container_label", "tool_label", "equipment_label", "panel_label", "cap_label", "hand_label"):
+        value = measurement.get(key)
+        if value:
+            terms.add(_norm(value))
+    interaction = measurement.get("interaction") if isinstance(measurement.get("interaction"), Mapping) else {}
+    for key in ("object_label", "hand_label"):
+        value = interaction.get(key)
+        if value:
+            terms.add(_norm(value))
+    for key in ("detected_objects", "visual_keywords"):
+        for item in row.get(key) or []:
+            terms.add(_norm(item))
+    terms.discard("")
+    return terms
+
+
+def _row_text(row: Mapping[str, Any]) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).casefold().replace("-", "_").replace(" ", "_")
+
+
 def _manifest_session_id(session: Path) -> str:
     for path in (session / "manifest.json", session / "metadata" / "manifest.json"):
         if not path.exists():
@@ -332,6 +563,7 @@ def _issue(
     path: str | None = None,
     row: int | None = None,
     details: Mapping[str, Any] | None = None,
+    semantic_category: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"severity": severity, "code": code, "message": message}
     if path:
@@ -340,11 +572,13 @@ def _issue(
         payload["row"] = row
     if details:
         payload["details"] = dict(details)
+    if semantic_category:
+        payload["semantic_category"] = semantic_category
     return payload
 
 
 def _has_value(row: Mapping[str, Any], key: str) -> bool:
-    value = row.get(key)
+    value = _nested_value(row, key)
     if value in (None, ""):
         return False
     if isinstance(value, list) and not value:
@@ -352,6 +586,36 @@ def _has_value(row: Mapping[str, Any], key: str) -> bool:
     if isinstance(value, Mapping) and not value:
         return False
     return True
+
+
+def _nested_value(row: Mapping[str, Any], key: str) -> Any:
+    if key in row:
+        return row.get(key)
+    for container_key in ("measurement", "metrics"):
+        nested = row.get(container_key)
+        if isinstance(nested, Mapping):
+            if key in nested:
+                return nested.get(key)
+            measurement = nested.get("measurement")
+            if isinstance(measurement, Mapping) and key in measurement:
+                return measurement.get(key)
+    return None
+
+
+def _read_jsonl_if_exists(path: Path) -> list[dict[str, Any]]:
+    return read_jsonl(path) if path.exists() else []
+
+
+def _first_text(row: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = _nested_value(row, key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _norm(value: Any) -> str:
+    return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
 
 
 def _first_float(row: Mapping[str, Any], *keys: str) -> float | None:

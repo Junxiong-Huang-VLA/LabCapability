@@ -83,9 +83,13 @@ def test_session_audit_summarizes_core_metrics_and_risks(tmp_path: Path) -> None
     assert row["metrics"]["micro_evidence"]["retrieval_candidate"] == 1
     assert row["metrics"]["micro_evidence"]["segment_level_backfill_count"] == 1
     assert row["metrics"]["micro_evidence"]["segment_level_backfill_promoted_count"] == 0
-    assert row["risks"][0]["code"] == "history_under_sampled"
+    risk_codes = {risk["code"] for risk in row["risks"]}
+    assert "history_key_action_under_sampled" in risk_codes
+    assert "history_step_reasoning_weak" in risk_codes
     assert "P4 Session Audit Summary" in markdown
+    assert "Final Acceptance Table" in markdown
     assert "Retrieval Acceptance" in markdown
+    assert "Query Semantic Diversity" in markdown
     assert "Backfill Evidence Guard" in markdown
     assert (tmp_path / "audit.json").exists()
     assert (tmp_path / "audit.md").exists()

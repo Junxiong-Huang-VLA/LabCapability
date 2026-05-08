@@ -23,6 +23,15 @@ LOW_SIGNAL_VIDEO_CANDIDATE_TYPES = {
     "liquid_transfer_candidate",
     "object_movement_candidate",
 }
+DECISION_ALIASES = {
+    "approve": "approved",
+    "approved": "approved",
+    "reject": "rejected",
+    "rejected": "rejected",
+    "needs_more_review": "needs_review",
+    "needs-review": "needs_review",
+    "needs_review": "needs_review",
+}
 
 
 def build_confirmation_queue(session_dir: str | Path, output_path: str | Path | None = None) -> dict[str, Any]:
@@ -110,9 +119,9 @@ def apply_confirmation_decision(
     reviewer: str = "system",
     note: str = "",
 ) -> dict[str, Any]:
-    normalized = str(decision or "").strip().lower()
-    if normalized not in {"approved", "rejected", "needs_review"}:
-        raise ValueError("decision must be one of: approved, rejected, needs_review")
+    normalized = _normalize_decision_value(decision)
+    if normalized is None:
+        raise ValueError("decision must be one of: approve, reject, needs_more_review")
     session = Path(session_dir)
     metadata = session / "metadata"
     decisions_path = metadata / DECISIONS_FILENAME
@@ -561,10 +570,11 @@ def _normalize_batch_decision_row(
         confirmation_id = step_id if ":" in step_id else f"{session_id}:{step_id}"
     if confirmation_id and ":" not in confirmation_id and step_id == "":
         confirmation_id = f"{session_id}:{confirmation_id}"
-    decision = str(source.get("decision") or source.get("status") or source.get("action") or "").strip().lower()
+    raw_decision = str(source.get("decision") or source.get("status") or source.get("action") or "").strip().lower()
+    decision = _normalize_decision_value(raw_decision)
     normalized = {
         "confirmation_id": confirmation_id,
-        "decision": decision,
+        "decision": decision or raw_decision,
         "reviewer": source.get("reviewer")
         or source.get("decider")
         or source.get("approved_by")
@@ -576,9 +586,14 @@ def _normalize_batch_decision_row(
     }
     if not confirmation_id:
         normalized["error"] = "missing_confirmation_id"
-    elif decision not in {"approved", "rejected", "needs_review"}:
+    elif decision is None:
         normalized["error"] = "invalid_decision"
     return normalized
+
+
+def _normalize_decision_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return DECISION_ALIASES.get(text)
 
 
 def _looks_like_decision_row(row: Mapping[str, Any]) -> bool:

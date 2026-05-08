@@ -224,6 +224,7 @@ def validate_queries(
         expected_level = str(rule.get("expected_index_level") or "")
         expected_time_window = rule.get("expected_time_window") if isinstance(rule.get("expected_time_window"), dict) else None
         require_traceability = bool(rule.get("require_traceability"))
+        id_authoritative = bool(rule.get("id_authoritative") or config.get("id_authoritative"))
         quality_policy = _quality_policy(rule, base=base_quality_policy)
         results = index.query(query, top_k=top_k)
         top = results[0] if results else {}
@@ -241,21 +242,28 @@ def validate_queries(
         traceability_hit_topk = any(_has_traceability(item) for item in results) if require_traceability else True
         fallback_top1_valid = bool(top and _fallback_valid(top, rule))
         fallback_valid = any(_fallback_valid(item, rule) for item in results)
-        top1_expected_hit = _result_matches_expectations(
-            top,
-            expected_objects=expected_objects,
-            expected_actions=expected_actions,
-            expected_segment_ids=expected_segment_ids,
-            expected_micro_segment_ids=expected_micro_segment_ids,
-            expected_level=expected_level,
-            expected_time_window=expected_time_window,
-            require_traceability=require_traceability,
-        )
-        expected_matches = [
-            item
-            for item in results
-            if _result_matches_expectations(
-                item,
+        if id_authoritative and (expected_segment_ids or expected_micro_segment_ids):
+            top1_expected_hit = _result_matches_authoritative_id(
+                top,
+                expected_segment_ids=expected_segment_ids,
+                expected_micro_segment_ids=expected_micro_segment_ids,
+                expected_time_window=expected_time_window,
+                require_traceability=require_traceability,
+            )
+            expected_matches = [
+                item
+                for item in results
+                if _result_matches_authoritative_id(
+                    item,
+                    expected_segment_ids=expected_segment_ids,
+                    expected_micro_segment_ids=expected_micro_segment_ids,
+                    expected_time_window=expected_time_window,
+                    require_traceability=require_traceability,
+                )
+            ]
+        else:
+            top1_expected_hit = _result_matches_expectations(
+                top,
                 expected_objects=expected_objects,
                 expected_actions=expected_actions,
                 expected_segment_ids=expected_segment_ids,
@@ -264,22 +272,39 @@ def validate_queries(
                 expected_time_window=expected_time_window,
                 require_traceability=require_traceability,
             )
-        ]
+            expected_matches = [
+                item
+                for item in results
+                if _result_matches_expectations(
+                    item,
+                    expected_objects=expected_objects,
+                    expected_actions=expected_actions,
+                    expected_segment_ids=expected_segment_ids,
+                    expected_micro_segment_ids=expected_micro_segment_ids,
+                    expected_level=expected_level,
+                    expected_time_window=expected_time_window,
+                    require_traceability=require_traceability,
+                )
+            ]
         accepted_matches = [item for item in expected_matches if not _quality_failures(item, quality_policy)]
         top1_quality_failures = _quality_failures(top, quality_policy) if top1_expected_hit else []
         top1_quality_hit = bool(top1_expected_hit and not top1_quality_failures)
         topk_quality_hit = bool(accepted_matches) if expected_matches else False
-        top1_hit = (
-            object_hit_top1
-            and level_hit_top1
-            and action_hit_top1
-            and id_hit_top1
-            and time_hit_top1
-            and traceability_hit_top1
-        ) or fallback_top1_valid
-        topk_hit = (
-            bool(expected_matches)
-        ) or fallback_valid
+        if id_authoritative and (expected_segment_ids or expected_micro_segment_ids):
+            top1_hit = id_hit_top1 and time_hit_top1 and traceability_hit_top1
+            topk_hit = id_hit_topk and time_hit_topk and traceability_hit_topk
+        else:
+            top1_hit = (
+                object_hit_top1
+                and level_hit_top1
+                and action_hit_top1
+                and id_hit_top1
+                and time_hit_top1
+                and traceability_hit_top1
+            ) or fallback_top1_valid
+            topk_hit = (
+                bool(expected_matches)
+            ) or fallback_valid
         acceptance_hit = bool(accepted_matches) or fallback_valid
         acceptance_hits += int(acceptance_hit)
         top1_hits += int(top1_hit)
@@ -312,6 +337,7 @@ def validate_queries(
                 "binding_source": rule.get("binding_source"),
                 "human_verified": bool(rule.get("human_verified")),
                 "manual_review_status": rule.get("manual_review_status"),
+                "id_authoritative": id_authoritative,
                 "top_k": top_k,
                 "top1_hit": top1_hit,
                 "topk_hit": topk_hit,
@@ -473,6 +499,25 @@ def _result_matches_expectations(
     if (expected_segment_ids or expected_micro_segment_ids) and not _id_hit(result, expected_segment_ids, expected_micro_segment_ids):
         return False
     if expected_level and str(result.get("index_level") or "") != expected_level:
+        return False
+    if expected_time_window and not _overlaps_expected_time_window(result, expected_time_window):
+        return False
+    if require_traceability and not _has_traceability(result):
+        return False
+    return True
+
+
+def _result_matches_authoritative_id(
+    result: dict[str, Any],
+    *,
+    expected_segment_ids: set[str],
+    expected_micro_segment_ids: set[str],
+    expected_time_window: dict[str, Any] | None,
+    require_traceability: bool,
+) -> bool:
+    if not result:
+        return False
+    if not _id_hit(result, expected_segment_ids, expected_micro_segment_ids):
         return False
     if expected_time_window and not _overlaps_expected_time_window(result, expected_time_window):
         return False

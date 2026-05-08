@@ -179,8 +179,10 @@ def _write_post_run_context(session_dir: Path) -> dict[str, Any]:
     return import_lightweight_context(
         session_dir,
         sop_text=(
-            "固体称量实验：重点关注电子天平、称量纸、药匙/刮勺、试剂瓶、样品容器、手套手与容器的接触，"
-            "以及称量前准备、取样、转移到称量纸、读数确认和收尾清理。"
+            "1. 准备称量区域、称量纸和电子天平，确认手套手与称量纸/容器的接触证据。\n"
+            "2. 使用药匙或刮勺取样并转移固体，关注 spatula 与手套手接触。\n"
+            "3. 在电子天平上完成称量或读数确认，关注 balance 与样品/称量纸的同框证据。\n"
+            "4. 操作试剂瓶或样品容器并收尾，关注 reagent_bottle、sample_bottle 与手套手接触。"
         ),
         note_text=(
             "本次用户指定双视角映射：camera_00 为第三人称视角，camera_01 为第一人称视角。"
