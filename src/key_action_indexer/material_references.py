@@ -558,9 +558,6 @@ def sync_professional_report_material_references(
     copied_rows: list[dict[str, Any]] = []
     for role, key in (
         ("professional_report_pdf", "pdf_path"),
-        ("professional_report_html", "html_path"),
-        ("professional_report_json", "sidecar_path"),
-        ("professional_report_manifest", "manifest_path"),
     ):
         source_value = report_summary.get(key) or (report_summary.get("json_path") if role == "professional_report_json" else None)
         if not source_value:
