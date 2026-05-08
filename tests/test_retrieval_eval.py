@@ -199,3 +199,60 @@ def test_not_applicable_gold_queries_are_excluded_from_eval_denominator(tmp_path
     assert result["excluded_query_count"] == 2
     assert result["failed_query_count"] == 0
     assert len([row for row in result["queries"] if row.get("excluded_from_evaluation")]) == 2
+
+
+def test_confirm_gold_query_benchmark_clears_stale_ids_when_reconfirmed(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    row = {
+        "index_level": "micro_segment",
+        "segment_id": "seg_1",
+        "micro_segment_id": "micro_1",
+        "primary_object": "balance",
+        "detected_objects": ["balance", "sample"],
+        "action_type": "weighing",
+        "evidence_level": "visual_confirmed",
+        "index_text": "balance weighing sample keyframe 绉伴噺 鏍峰搧 澶╁钩",
+        "keyframes": ["peak.jpg"],
+    }
+    write_jsonl(metadata / "micro_segments.jsonl", [row])
+    write_jsonl(metadata / "micro_vector_metadata.jsonl", [row])
+    index = VectorIndex()
+    index.build([row["index_text"]], [row])
+    index.save(session / "index")
+    gold_path = metadata / "gold_query_benchmark.json"
+    gold = build_gold_query_benchmark(session, query_count=2, overwrite=True)
+    for query in gold["queries"]:
+        query["expected_segment_ids"] = ["stale_segment"]
+        query["expected_micro_segment_ids"] = ["stale_micro"]
+        query["verified_top_result"] = {"segment_id": "stale_segment", "micro_segment_id": "stale_micro"}
+    gold_path.write_text(json.dumps(gold), encoding="utf-8")
+
+    decisions = {
+        "decisions": [
+            {
+                "query_id": "gold_cn_001",
+                "decision": "approved",
+                "expected_micro_segment_ids": ["micro_1"],
+                "expected_index_level": "micro_segment",
+                "reviewer": "tester",
+            },
+            {"query_id": "gold_cn_002", "decision": "not_applicable", "reviewer": "tester", "note": "no tube workflow"},
+        ]
+    }
+    decisions_path = metadata / "gold_query_decisions.json"
+    decisions_path.write_text(json.dumps(decisions), encoding="utf-8")
+
+    confirmed = confirm_gold_query_benchmark(session, query_count=2, reviewer="tester", decisions_path=decisions_path)
+    result = run_default_chinese_query_eval(session, query_count=2)
+
+    approved, excluded = confirmed["queries"]
+    assert "expected_segment_ids" not in approved
+    assert approved["expected_micro_segment_ids"] == ["micro_1"]
+    assert "verified_top_result" not in approved
+    assert "expected_segment_ids" not in excluded
+    assert "expected_micro_segment_ids" not in excluded
+    assert "verified_top_result" not in excluded
+    assert result["status"] == "pass"
+    assert result["expected_id_hit_rate"] == 1.0

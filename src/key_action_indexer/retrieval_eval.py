@@ -206,6 +206,8 @@ def confirm_gold_query_benchmark(
             continue
         status = _normalize_gold_decision(decision.get("decision") or decision.get("status"))
         if status in EXCLUDED_GOLD_DECISIONS:
+            for key in ("expected_segment_ids", "expected_micro_segment_ids", "expected_time_window", "verified_top_result"):
+                row.pop(key, None)
             row["human_verified"] = True
             row["manual_review_status"] = status
             row["evaluation_scope"] = "excluded"
@@ -238,11 +240,17 @@ def confirm_gold_query_benchmark(
             unresolved.append(query_id or row.get("query"))
             confirmed.append(row)
             continue
+        row.pop("verified_top_result", None)
+        row.pop("evaluation_scope", None)
+        row.pop("exclusion_status", None)
+        row.pop("exclusion_reason", None)
         if segment_ids:
             row["expected_segment_ids"] = segment_ids
+        elif micro_ids:
+            row.pop("expected_segment_ids", None)
         if micro_ids:
             row["expected_micro_segment_ids"] = micro_ids
-        elif "expected_micro_segment_ids" in row:
+        elif segment_ids:
             row.pop("expected_micro_segment_ids", None)
         if decision.get("expected_index_level"):
             row["expected_index_level"] = str(decision["expected_index_level"])
