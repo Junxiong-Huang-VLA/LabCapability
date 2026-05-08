@@ -15,6 +15,7 @@ DEFAULT_QUERY_COUNT = 50
 GOLD_QUERY_BENCHMARK_FILENAME = "gold_query_benchmark.json"
 TREND_JSONL_FILENAME = "retrieval_eval_trend.jsonl"
 TREND_MD_FILENAME = "retrieval_eval_trend.md"
+EXCLUDED_GOLD_DECISIONS = {"not_applicable", "out_of_scope"}
 
 FIXED_CHINESE_QUERY_BENCHMARK: tuple[tuple[str, list[str], list[str], str], ...] = (
     ("称量样品", ["balance", "sample", "weighing_paper"], ["weighing"], "micro_segment"),
@@ -89,6 +90,10 @@ def build_default_chinese_query_eval_config(
         "gold_benchmark_path": str(metadata / GOLD_QUERY_BENCHMARK_FILENAME),
         "benchmark_binding_mode": gold.get("binding_mode"),
         "human_verified_query_count": gold.get("human_verified_query_count"),
+        "human_reviewed_query_count": gold.get("human_reviewed_query_count"),
+        "total_query_count": _count_or(gold.get("total_query_count"), _count_or(gold.get("query_count"), selected_count)),
+        "applicable_query_count": _count_or(gold.get("applicable_query_count"), _count_or(gold.get("query_count"), selected_count)),
+        "excluded_query_count": gold.get("excluded_query_count"),
         "id_authoritative": bool(gold.get("id_authoritative")),
         "thresholds": {
             "min_acceptance_hit_rate": 0.4,
@@ -153,7 +158,11 @@ def build_gold_query_benchmark(
         "benchmark_version": "2026-05-08.fixed50.human_gt",
         "session_dir": str(session),
         "query_count": len(rules),
+        "total_query_count": len(rules),
+        "applicable_query_count": len(rules),
+        "excluded_query_count": 0,
         "human_verified_query_count": sum(1 for rule in rules if rule.get("human_verified")),
+        "human_reviewed_query_count": sum(1 for rule in rules if rule.get("human_verified")),
         "binding_mode": "bootstrap_pending_human_verification",
         "id_authoritative": False,
         "note": "Expected segment/micro ids are human GT slots. bootstrap_auto bindings are only initial anchors until human_verified=true.",
@@ -196,6 +205,19 @@ def confirm_gold_query_benchmark(
             confirmed.append(row)
             continue
         status = _normalize_gold_decision(decision.get("decision") or decision.get("status"))
+        if status in EXCLUDED_GOLD_DECISIONS:
+            row["human_verified"] = True
+            row["manual_review_status"] = status
+            row["evaluation_scope"] = "excluded"
+            row["exclusion_status"] = status
+            row["exclusion_reason"] = decision.get("reason") or decision.get("note") or note
+            row["binding_source"] = "human_confirmed_exclusion_file"
+            row["id_authoritative"] = False
+            row["verified_by"] = decision.get("reviewer") or reviewer
+            row["verified_at"] = now
+            row["verification_note"] = decision.get("note") or note
+            confirmed.append(row)
+            continue
         if status != "approved":
             row["human_verified"] = False
             row["manual_review_status"] = "rejected" if status == "rejected" else "needs_more_review"
@@ -235,15 +257,43 @@ def confirm_gold_query_benchmark(
         row["verification_note"] = decision.get("note") or note
         confirmed.append(row)
     categories = Counter(str(rule.get("benchmark_category") or "uncategorized") for rule in confirmed)
-    human_verified_count = sum(1 for rule in confirmed if rule.get("human_verified"))
-    fully_verified = human_verified_count == len(confirmed)
+    applicable = [rule for rule in confirmed if not _is_excluded_gold_query(rule)]
+    excluded = [rule for rule in confirmed if _is_excluded_gold_query(rule)]
+    human_verified_count = sum(1 for rule in applicable if rule.get("human_verified"))
+    human_reviewed_count = sum(
+        1
+        for rule in confirmed
+        if rule.get("human_verified") or str(rule.get("manual_review_status") or "") in {"rejected", "needs_more_review", "needs_review"}
+    )
+    fully_verified = bool(confirmed) and human_verified_count == len(applicable) and human_reviewed_count == len(confirmed)
     payload = {
-        **{key: value for key, value in gold.items() if key not in {"queries", "categories", "human_verified_query_count", "binding_mode", "id_authoritative"}},
+        **{
+            key: value
+            for key, value in gold.items()
+            if key
+            not in {
+                "queries",
+                "categories",
+                "applicable_categories",
+                "excluded_categories",
+                "human_verified_query_count",
+                "human_reviewed_query_count",
+                "total_query_count",
+                "applicable_query_count",
+                "excluded_query_count",
+                "binding_mode",
+                "id_authoritative",
+            }
+        },
         "schema_version": "key_action_gold_query_benchmark.v1",
         "benchmark_version": "2026-05-08.fixed50.human_review_file",
         "session_dir": str(session),
         "query_count": len(confirmed),
+        "total_query_count": len(confirmed),
+        "applicable_query_count": len(applicable),
+        "excluded_query_count": len(excluded),
         "human_verified_query_count": human_verified_count,
+        "human_reviewed_query_count": human_reviewed_count,
         "binding_mode": "human_verified_review_file" if fully_verified else "partial_human_verified_review_file",
         "id_authoritative": fully_verified,
         "verified_by": reviewer,
@@ -252,6 +302,8 @@ def confirm_gold_query_benchmark(
         "unresolved_query_ids": unresolved,
         "source_decisions_path": str(decisions_path),
         "categories": dict(sorted(categories.items())),
+        "applicable_categories": dict(sorted(Counter(str(rule.get("benchmark_category") or "uncategorized") for rule in applicable).items())),
+        "excluded_categories": dict(sorted(Counter(str(rule.get("benchmark_category") or "uncategorized") for rule in excluded).items())),
         "queries": confirmed,
     }
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +392,9 @@ def _append_trend(session: Path, result: Mapping[str, Any]) -> None:
         "generated_at": result.get("generated_at"),
         "status": result.get("status"),
         "query_count": result.get("query_count"),
+        "total_query_count": result.get("total_query_count"),
+        "applicable_query_count": result.get("applicable_query_count"),
+        "excluded_query_count": result.get("excluded_query_count"),
         "top1_hit_rate": result.get("top1_hit_rate"),
         "top3_hit_rate": result.get("topk_hit_rate"),
         "expected_id_hit_rate": result.get("expected_id_hit_rate"),
@@ -376,6 +431,8 @@ def _append_trend(session: Path, result: Mapping[str, Any]) -> None:
 def _category_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     summary: dict[str, dict[str, Any]] = {}
     for row in rows:
+        if row.get("excluded_from_evaluation"):
+            continue
         category = str(row.get("benchmark_category") or "uncategorized")
         bucket = summary.setdefault(
             category,
@@ -485,10 +542,31 @@ def _normalize_gold_decision(value: Any) -> str:
         "needs_more_review": "needs_review",
         "needs-review": "needs_review",
         "needs_review": "needs_review",
+        "not_applicable": "not_applicable",
+        "not-applicable": "not_applicable",
+        "not applicable": "not_applicable",
+        "na": "not_applicable",
+        "n/a": "not_applicable",
+        "out_of_scope": "out_of_scope",
+        "out-of-scope": "out_of_scope",
+        "out of scope": "out_of_scope",
     }
     if text not in aliases:
-        raise ValueError("gold query decision must be one of: approve, reject, needs_more_review")
+        raise ValueError("gold query decision must be one of: approve, reject, needs_more_review, not_applicable, out_of_scope")
     return aliases[text]
+
+
+def _is_excluded_gold_query(row: Mapping[str, Any]) -> bool:
+    return str(row.get("evaluation_scope") or "") == "excluded" or str(row.get("manual_review_status") or "") in EXCLUDED_GOLD_DECISIONS
+
+
+def _count_or(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _string_list(value: Any) -> list[str]:

@@ -248,14 +248,29 @@ def promote_reviewed_release(
         evaluation = run_default_chinese_query_eval(session, output_path=candidate_eval_path, query_count=query_count)
     finally:
         _ACTIVE_RELEASE_OVERRIDE.reset(token)
-    human_verified = int(evaluation.get("human_verified_query_count") or 0)
+    human_verified = _int_or_default(evaluation.get("human_verified_query_count"), 0)
+    human_reviewed = _int_or_default(evaluation.get("human_reviewed_query_count"), human_verified)
+    query_total = _int_or_default(evaluation.get("query_count"), 0)
+    total_queries = _int_or_default(evaluation.get("total_query_count"), query_total)
+    applicable_queries = _int_or_default(evaluation.get("applicable_query_count"), query_total)
+    excluded_queries = _int_or_default(evaluation.get("excluded_query_count"), 0)
     failures: list[dict[str, Any]] = []
     if gate.get("status") != "pass" or not gate.get("can_mark_complete"):
         failures.append({"gate": gate.get("status"), "blocking_checks": gate.get("blocking_checks")})
     if evaluation.get("status") != "pass":
         failures.append({"retrieval_eval": evaluation.get("status"), "threshold_failures": evaluation.get("threshold_failures")})
-    if human_verified < query_count:
-        failures.append({"gold_query_benchmark": "not_fully_human_verified", "human_verified_query_count": human_verified, "required": query_count})
+    if total_queries < query_count:
+        failures.append({"gold_query_benchmark": "incomplete_fixed_query_review", "total_query_count": total_queries, "required": query_count})
+    if human_reviewed < total_queries or human_verified < applicable_queries:
+        failures.append(
+            {
+                "gold_query_benchmark": "not_fully_human_verified",
+                "human_verified_query_count": human_verified,
+                "applicable_query_count": applicable_queries,
+                "human_reviewed_query_count": human_reviewed,
+                "total_query_count": total_queries,
+            }
+        )
     if failures:
         raise ValueError("reviewed release cannot be promoted: " + json.dumps(failures, ensure_ascii=False, default=str))
 
@@ -278,7 +293,11 @@ def promote_reviewed_release(
             "gold_benchmark_binding_mode": evaluation.get("benchmark_binding_mode"),
             "gold_benchmark_path": evaluation.get("gold_benchmark_path"),
             "human_verified_query_count": human_verified,
+            "human_reviewed_query_count": human_reviewed,
             "query_count": evaluation.get("query_count"),
+            "total_query_count": total_queries,
+            "applicable_query_count": applicable_queries,
+            "excluded_query_count": excluded_queries,
             "top1_hit_rate": evaluation.get("top1_hit_rate"),
             "top3_hit_rate": evaluation.get("topk_hit_rate"),
             "expected_id_hit_rate": evaluation.get("expected_id_hit_rate"),
@@ -1205,6 +1224,15 @@ def _float(value: Any, default: float | None = None) -> float | None:
         if value in (None, ""):
             return default
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
     except (TypeError, ValueError):
         return default
 

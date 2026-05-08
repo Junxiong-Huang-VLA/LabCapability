@@ -405,13 +405,18 @@ def _query_validation_metrics(session: Path) -> dict[str, Any]:
         status = str(data.get("status") or "unknown")
         threshold_failures = data.get("threshold_failures") if isinstance(data.get("threshold_failures"), list) else []
         failed_query_count = int(data.get("failed_query_count") or 0)
+        query_count = _int_or_default(data.get("query_count"), 0)
         artifact = {
             "path": str(path),
             "name": path.name,
             "status": status,
             "benchmark_binding_mode": data.get("benchmark_binding_mode"),
-            "human_verified_query_count": int(data.get("human_verified_query_count") or 0),
-            "query_count": int(data.get("query_count") or 0),
+            "human_verified_query_count": _int_or_default(data.get("human_verified_query_count"), 0),
+            "human_reviewed_query_count": _int_or_default(data.get("human_reviewed_query_count"), _int_or_default(data.get("human_verified_query_count"), 0)),
+            "query_count": query_count,
+            "total_query_count": _int_or_default(data.get("total_query_count"), query_count),
+            "applicable_query_count": _int_or_default(data.get("applicable_query_count"), query_count),
+            "excluded_query_count": _int_or_default(data.get("excluded_query_count"), 0),
             "acceptance_hit_rate": _float(data.get("acceptance_hit_rate")),
             "query_hit_rate": _float(data.get("query_hit_rate")),
             "top1_hit_rate": _float(data.get("top1_hit_rate")),
@@ -628,6 +633,15 @@ def _float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _issue(code: str, message: str, **details: Any) -> dict[str, Any]:

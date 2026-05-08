@@ -10,6 +10,8 @@ from .vector_index import VectorIndex
 
 QUERY_VALIDATION_SCHEMA_VERSION = "key_action_query_validation.v3"
 
+EXCLUDED_GOLD_QUERY_STATUSES = {"not_applicable", "out_of_scope"}
+
 DEFAULT_ACCEPTANCE_THRESHOLDS: dict[str, float] = {
     "min_acceptance_hit_rate": 1.0,
 }
@@ -214,8 +216,48 @@ def validate_queries(
     expected_time_window_hits = 0
     traceability_hits = 0
     valid_fallbacks = 0
+    total_rule_count = 0
+    excluded_query_count = 0
     for rule in config.get("queries", []):
+        total_rule_count += 1
         query = str(rule.get("query") or "")
+        exclusion_status = _query_exclusion_status(rule)
+        if exclusion_status:
+            excluded_query_count += 1
+            rows.append(
+                {
+                    "query_id": rule.get("query_id"),
+                    "query": query,
+                    "benchmark_category": rule.get("benchmark_category"),
+                    "binding_source": rule.get("binding_source"),
+                    "human_verified": bool(rule.get("human_verified")),
+                    "manual_review_status": rule.get("manual_review_status") or exclusion_status,
+                    "evaluation_scope": "excluded",
+                    "excluded_from_evaluation": True,
+                    "exclusion_status": exclusion_status,
+                    "exclusion_reason": rule.get("exclusion_reason") or rule.get("verification_note"),
+                    "top_k": int(rule.get("top_k") or 3),
+                    "top1_hit": None,
+                    "topk_hit": None,
+                    "expected_object_hit": None,
+                    "expected_index_level_hit": None,
+                    "expected_action_hit": None,
+                    "expected_id_hit": None,
+                    "expected_time_window_hit": None,
+                    "traceability_hit": None,
+                    "quality_hit": None,
+                    "acceptance_hit": None,
+                    "fallback_reason_valid": False,
+                    "matching_result_count": 0,
+                    "accepted_result_count": 0,
+                    "top1_quality_failures": [],
+                    "failure_explanation": [f"excluded_from_evaluation:{exclusion_status}"],
+                    "quality_policy": _quality_policy(rule, base=base_quality_policy),
+                    "top_result": None,
+                    "accepted_result": None,
+                }
+            )
+            continue
         top_k = int(rule.get("top_k") or 3)
         expected_objects = {_norm(item) for item in rule.get("expected_objects") or []}
         expected_actions = {_norm(item) for item in rule.get("expected_actions") or []}
@@ -384,7 +426,8 @@ def validate_queries(
                 "accepted_result": _accepted_result_summary(accepted_matches[0]) if accepted_matches else None,
             }
         )
-    total = len(rows)
+    evaluated_rows = [row for row in rows if not row.get("excluded_from_evaluation")]
+    total = len(evaluated_rows)
     failed_queries = [
         {
             "query": row["query"],
@@ -400,7 +443,7 @@ def validate_queries(
             "top_result": row.get("top_result"),
         }
         for row in rows
-        if not row["acceptance_hit"]
+        if not row.get("excluded_from_evaluation") and not row["acceptance_hit"]
     ]
     result: dict[str, Any] = {
         "schema_version": QUERY_VALIDATION_SCHEMA_VERSION,
@@ -409,7 +452,11 @@ def validate_queries(
         "benchmark_version": config.get("benchmark_version"),
         "benchmark_binding_mode": config.get("benchmark_binding_mode"),
         "human_verified_query_count": config.get("human_verified_query_count"),
+        "human_reviewed_query_count": config.get("human_reviewed_query_count"),
         "gold_benchmark_path": config.get("gold_benchmark_path"),
+        "total_query_count": _int_or_default(config.get("total_query_count"), total_rule_count or len(rows)),
+        "applicable_query_count": _int_or_default(config.get("applicable_query_count"), total),
+        "excluded_query_count": _int_or_default(config.get("excluded_query_count"), excluded_query_count),
         "session_dir": str(session),
         "index_dir": str(index_dir),
         "config": str(config_path),
@@ -439,6 +486,32 @@ def validate_queries(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def _query_exclusion_status(rule: Mapping[str, Any]) -> str:
+    values = [
+        rule.get("evaluation_scope"),
+        rule.get("manual_review_status"),
+        rule.get("decision"),
+        rule.get("status"),
+    ]
+    for value in values:
+        text = _norm(value)
+        if text == "excluded":
+            status = _norm(rule.get("exclusion_status"))
+            return status if status in EXCLUDED_GOLD_QUERY_STATUSES else "out_of_scope"
+        if text in EXCLUDED_GOLD_QUERY_STATUSES:
+            return text
+    return ""
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _validation_thresholds(config: Mapping[str, Any]) -> dict[str, float]:

@@ -74,6 +74,10 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
         queue = _as_dict(row.get("review_queue"))
         candidate = _as_dict(releases.get("latest_candidate_eval"))
         candidate_label = _candidate_eval_label(candidate)
+        applicable_gold_count = _as_int(
+            gold.get("applicable_query_count"),
+            _as_int(gold.get("query_count"), _as_int(report.get("query_count_required"), 0)),
+        )
         lines.append(
             "| "
             f"`{row.get('session_id')}` | "
@@ -82,7 +86,8 @@ def render_promotion_readiness_markdown(report: Mapping[str, Any]) -> str:
             f"`{releases.get('promoted_version') or ''}` | "
             f"`{releases.get('state') or ''}` | "
             f"`{gate.get('status') or 'missing'}` | "
-            f"{gold.get('human_verified_query_count') or 0}/{gold.get('query_count') or report.get('query_count_required') or 0} | "
+            f"{_as_int(gold.get('human_verified_query_count'), 0)}/{applicable_gold_count}"
+            f" (+{_as_int(gold.get('excluded_query_count'), 0)} excluded) | "
             f"`{evaluation.get('status') or 'missing'}` | "
             f"`{candidate_label}` | "
             f"{adapters.get('semantic_issue_count') or 0} | "
@@ -228,14 +233,26 @@ def _gold_summary(session: Path, *, query_count: int) -> dict[str, Any]:
     )
     queries = [item for item in data.get("queries") or [] if isinstance(item, Mapping)]
     unresolved = data.get("unresolved_query_ids") if isinstance(data.get("unresolved_query_ids"), list) else []
-    human_verified_count = int(data.get("human_verified_query_count") or sum(1 for item in queries if item.get("human_verified")))
-    actual_query_count = int(data.get("query_count") or len(queries) or 0)
+    reviewed_statuses = {"not_applicable", "out_of_scope", "rejected", "needs_more_review", "needs_review"}
+    human_verified_count = _as_int(data.get("human_verified_query_count"), sum(1 for item in queries if item.get("human_verified")))
+    human_reviewed_count = _as_int(
+        data.get("human_reviewed_query_count"),
+        sum(1 for item in queries if item.get("human_verified") or str(item.get("manual_review_status") or "") in reviewed_statuses),
+    )
+    actual_query_count = _as_int(data.get("query_count"), len(queries))
+    total_query_count = _as_int(data.get("total_query_count"), actual_query_count)
+    applicable_query_count = _as_int(data.get("applicable_query_count"), actual_query_count)
+    excluded_query_count = _as_int(data.get("excluded_query_count"), 0)
     return {
         "available": bool(data),
         "path": str(path) if path.exists() else None,
         "query_count": actual_query_count,
+        "total_query_count": total_query_count,
+        "applicable_query_count": applicable_query_count,
+        "excluded_query_count": excluded_query_count,
         "required_query_count": query_count,
         "human_verified_query_count": human_verified_count,
+        "human_reviewed_query_count": human_reviewed_count,
         "binding_mode": data.get("binding_mode"),
         "id_authoritative": bool(data.get("id_authoritative")),
         "manual_review_status": data.get("manual_review_status"),
@@ -244,8 +261,9 @@ def _gold_summary(session: Path, *, query_count: int) -> dict[str, Any]:
         "unresolved_query_count": len(unresolved),
         "fully_human_verified": bool(
             data
-            and human_verified_count >= query_count
-            and actual_query_count >= query_count
+            and human_verified_count >= applicable_query_count
+            and human_reviewed_count >= total_query_count
+            and total_query_count >= query_count
             and data.get("binding_mode") == "human_verified_review_file"
             and data.get("id_authoritative")
         ),
@@ -261,7 +279,10 @@ def _eval_summary(session: Path, *, query_count: int) -> dict[str, Any]:
             data = metadata_candidate
             path = session / "metadata" / "default_chinese_query_validation.json"
     thresholds = data.get("threshold_failures") if isinstance(data.get("threshold_failures"), list) else []
-    actual_query_count = int(data.get("query_count") or 0)
+    actual_query_count = _as_int(data.get("query_count"), 0)
+    total_query_count = _as_int(data.get("total_query_count"), actual_query_count)
+    applicable_query_count = _as_int(data.get("applicable_query_count"), actual_query_count)
+    excluded_query_count = _as_int(data.get("excluded_query_count"), 0)
     return {
         "available": bool(data),
         "path": str(path) if data else None,
@@ -269,16 +290,20 @@ def _eval_summary(session: Path, *, query_count: int) -> dict[str, Any]:
         "generated_at": data.get("generated_at"),
         "index_dir": data.get("index_dir"),
         "query_count": actual_query_count,
+        "total_query_count": total_query_count,
+        "applicable_query_count": applicable_query_count,
+        "excluded_query_count": excluded_query_count,
         "required_query_count": query_count,
         "benchmark_binding_mode": data.get("benchmark_binding_mode"),
-        "human_verified_query_count": int(data.get("human_verified_query_count") or 0),
+        "human_verified_query_count": _as_int(data.get("human_verified_query_count"), 0),
+        "human_reviewed_query_count": _as_int(data.get("human_reviewed_query_count"), 0),
         "top1_hit_rate": data.get("top1_hit_rate"),
         "top3_hit_rate": data.get("topk_hit_rate"),
         "expected_id_hit_rate": data.get("expected_id_hit_rate"),
         "traceability_hit_rate": data.get("traceability_hit_rate"),
         "failed_query_count": int(data.get("failed_query_count") or 0),
         "threshold_failure_count": len(thresholds),
-        "passes_required_eval": bool(data and data.get("status") == "pass" and actual_query_count >= query_count),
+        "passes_required_eval": bool(data and data.get("status") == "pass" and total_query_count >= query_count and actual_query_count >= applicable_query_count),
     }
 
 
@@ -574,12 +599,15 @@ def _blockers(
                 "gold_benchmark_not_human_verified",
                 (
                     "Gold query benchmark is not fully human verified "
-                    f"({gold.get('human_verified_query_count')}/{query_count})."
+                    f"({_as_int(gold.get('human_verified_query_count'), 0)}/{_as_int(gold.get('applicable_query_count'), query_count)} applicable, "
+                    f"{_as_int(gold.get('human_reviewed_query_count'), 0)}/{_as_int(gold.get('total_query_count'), query_count)} total reviewed)."
                 ),
                 f"python -m key_action_indexer.cli confirm-gold-query-benchmark --session-dir {session} --decisions <decision_file> --query-count {query_count} --reviewer <reviewer>",
                 details={
                     "binding_mode": gold.get("binding_mode"),
                     "id_authoritative": gold.get("id_authoritative"),
+                    "applicable_query_count": gold.get("applicable_query_count"),
+                    "excluded_query_count": gold.get("excluded_query_count"),
                     "decision_files": gold.get("decision_files") or [],
                 },
             )
@@ -812,6 +840,15 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_path_token(value: Any) -> str:
