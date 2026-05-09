@@ -30,6 +30,9 @@ MATERIAL_CANDIDATE_INDEX_BASENAME = "\u7d20\u6750\u5019\u9009\u7d22\u5f15"
 MATERIAL_CANDIDATE_REVIEW_LOG = "review_log.jsonl"
 MATERIAL_REVIEW_QUEUE_DIR_NAME = "_material_review_queue"
 LEGACY_MATERIAL_CANDIDATE_DIR_NAME = "material_candidates"
+MATERIAL_TAXONOMY_SCHEMA_VERSION = "material_action_taxonomy.v1"
+MATERIAL_REFERENCE_TRACE_SCHEMA_VERSION = "material_reference_trace.v1"
+MATERIAL_CANDIDATE_DISPOSITION_SCHEMA_VERSION = "material_candidate_disposition.v1"
 YOLO_SUFFIX = "YOLO\u6807\u6ce8"
 NAMING_RULE = "\u6b63\u5f0f\u4ea4\u4ed8\u76ee\u5f55=\u5b9e\u9a8c\u6807\u9898_\u65e5\u671f\uff1b\u5173\u952e\u5e27/\u5173\u952e\u7247\u6bb5=\u624b\u4e0e\u88ab\u4ea4\u4e92\u5bf9\u8c61\u64cd\u4f5c_\u65e5\u671f[_\u5e8f\u53f7].\u6269\u5c55\u540d"
 README_TITLE = "\u5173\u952e\u7269\u7406\u52a8\u4f5c\u7d20\u6750\u5f15\u7528"
@@ -820,6 +823,8 @@ def approve_material_candidates(
     candidate_ids: list[str] | None = None,
     reviewer: str | None = None,
     notes: str | None = None,
+    reason_code: str | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Promote reviewed candidate files into the formal material reference folder."""
 
@@ -853,16 +858,24 @@ def approve_material_candidates(
             updated.update(
                 {
                     **_canonical_action_fields(row.get("primary_object") or row.get("canonical_object"), row.get("action_name")),
+                    "candidate_disposition_schema_version": MATERIAL_CANDIDATE_DISPOSITION_SCHEMA_VERSION,
                     "candidate_status": "approved",
                     "review_status": "accepted",
                     "approved_at": approved_at,
                     "approved_by": reviewer or "operator",
                     "review_notes": notes,
+                    "approval_reason_code": reason_code or "representative_yolo_hand_object_evidence",
+                    "approval_reason": reason or notes or "Approved as representative hand-object evidence for the canonical material library.",
                 }
             )
         elif str(row.get("candidate_group_id") or "") in selected_groups:
+            updated["candidate_disposition_schema_version"] = MATERIAL_CANDIDATE_DISPOSITION_SCHEMA_VERSION
             updated["candidate_status"] = "not_selected"
             updated["review_status"] = "not_selected"
+            updated["disposition"] = "not_selected_after_group_approval"
+            updated["reviewed_at"] = approved_at
+            updated["reviewed_by"] = reviewer or "operator"
+            updated["review_notes"] = "Not selected because a stronger representative asset from the same candidate group was approved."
         updated_rows.append(updated)
 
     _write_jsonl(index_jsonl, updated_rows)
@@ -875,6 +888,8 @@ def approve_material_candidates(
             "decision": "approved",
             "candidate_group_id": candidate_group_id,
             "candidate_ids": sorted(selected_ids),
+            "reason_code": reason_code or "representative_yolo_hand_object_evidence",
+            "reason": reason or notes,
             "notes": notes,
         },
     )
@@ -964,6 +979,7 @@ def dispose_material_candidates(
         if str(row.get("candidate_id") or "") in target_ids:
             updated.update(
                 {
+                    "candidate_disposition_schema_version": MATERIAL_CANDIDATE_DISPOSITION_SCHEMA_VERSION,
                     "candidate_status": candidate_status,
                     "review_status": candidate_status,
                     "disposition": normalized_decision,
@@ -1011,6 +1027,100 @@ def dispose_material_candidates(
         "candidate_ids": sorted(target_ids),
         "reason_code": normalized_reason,
         "updated_count": len(target_ids),
+        "material_references_summary": sync_summary,
+        "candidate_index": str(index_jsonl),
+    }
+
+
+def restore_material_candidates(
+    session_dir: str | Path,
+    *,
+    candidate_group_id: str,
+    candidate_ids: list[str] | None = None,
+    reviewer: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Return disposed candidates to the default review queue while preserving audit history."""
+
+    session_root = Path(session_dir)
+    candidate_root = existing_material_candidates_root(session_root)
+    index_jsonl = candidate_root / f"{MATERIAL_CANDIDATE_INDEX_BASENAME}.jsonl"
+    rows = read_jsonl(index_jsonl)
+    if not rows:
+        raise FileNotFoundError(f"Material candidate index is not ready: {index_jsonl}")
+
+    explicit_ids = {str(item) for item in (candidate_ids or []) if str(item).strip()}
+    target_ids: set[str] = set()
+    for row in rows:
+        row_group = str(row.get("candidate_group_id") or "")
+        row_id = str(row.get("candidate_id") or "")
+        if explicit_ids and row_id in explicit_ids:
+            target_ids.add(row_id)
+        elif not explicit_ids and row_group == str(candidate_group_id):
+            target_ids.add(row_id)
+    if not target_ids:
+        raise ValueError("No material candidates matched the restore request")
+
+    restored_at = datetime.now().astimezone().isoformat()
+    updated_rows: list[dict[str, Any]] = []
+    restored_from: dict[str, int] = {}
+    for row in rows:
+        updated = dict(row)
+        if str(row.get("candidate_id") or "") in target_ids:
+            previous_status = str(row.get("candidate_status") or row.get("review_status") or "pending")
+            restored_from[previous_status] = restored_from.get(previous_status, 0) + 1
+            if row.get("rejection_reason_code"):
+                updated["previous_rejection_reason_code"] = row.get("rejection_reason_code")
+            if row.get("rejection_reason"):
+                updated["previous_rejection_reason"] = row.get("rejection_reason")
+            updated.update(
+                {
+                    "candidate_status": "pending",
+                    "review_status": "pending",
+                    "disposition": "restored_for_review",
+                    "restored_at": restored_at,
+                    "restored_by": reviewer or "operator",
+                    "reviewed_at": None,
+                    "reviewed_by": None,
+                    "review_notes": notes or "Restored to the material review queue.",
+                    "rejection_reason_code": None,
+                    "rejection_reason": None,
+                }
+            )
+        updated_rows.append(updated)
+
+    _write_jsonl(index_jsonl, updated_rows)
+    _refresh_candidate_review_metadata(candidate_root, updated_rows)
+    _append_review_log(
+        candidate_root / MATERIAL_CANDIDATE_REVIEW_LOG,
+        {
+            "reviewed_at": restored_at,
+            "reviewer": reviewer or "operator",
+            "decision": "restored",
+            "candidate_group_id": candidate_group_id,
+            "candidate_ids": sorted(target_ids),
+            "restored_from": restored_from,
+            "notes": notes,
+        },
+    )
+    approved_for_sync = [
+        row
+        for row in updated_rows
+        if str(row.get("candidate_status") or "").lower() == "approved"
+        or str(row.get("review_status") or "").lower() == "accepted"
+    ]
+    sync_summary = reset_material_references_to_approved_candidates(
+        session_root,
+        approved_rows=approved_for_sync,
+        merge_existing=True,
+    )
+    return {
+        "schema_version": "material_candidate_restore.v1",
+        "decision": "restored",
+        "candidate_group_id": candidate_group_id,
+        "candidate_ids": sorted(target_ids),
+        "updated_count": len(target_ids),
+        "restored_from": restored_from,
         "material_references_summary": sync_summary,
         "candidate_index": str(index_jsonl),
     }
@@ -1242,6 +1352,15 @@ def _best_candidate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _approved_reference_record_from_candidate(row: dict[str, Any], source_file: Path, target: Path) -> dict[str, Any]:
     approved = dict(row)
+    evidence_chain = dict(approved.get("evidence_chain") if isinstance(approved.get("evidence_chain"), dict) else {})
+    evidence_chain.update(
+        {
+            "schema_version": evidence_chain.get("schema_version") or MATERIAL_REFERENCE_TRACE_SCHEMA_VERSION,
+            "candidate_disposition": "approved",
+            "source_candidate_file": str(source_file),
+            "formal_material_file": str(target),
+        }
+    )
     approved.update(
         {
             **_canonical_action_fields(row.get("primary_object") or row.get("canonical_object"), row.get("action_name")),
@@ -1252,6 +1371,8 @@ def _approved_reference_record_from_candidate(row: dict[str, Any], source_file: 
             "source_candidate_file": str(source_file),
             "exists": target.is_file(),
             "size_bytes": target.stat().st_size if target.is_file() else 0,
+            "candidate_disposition_schema_version": row.get("candidate_disposition_schema_version") or MATERIAL_CANDIDATE_DISPOSITION_SCHEMA_VERSION,
+            "evidence_chain": evidence_chain,
             "candidate_status": "approved",
             "review_status": "accepted",
             "formal_material_reference": True,
@@ -1463,6 +1584,7 @@ def _canonical_action_fields(primary_object: Any, action_name: Any = None) -> di
         if text == key or key in text:
             action_type, canonical_object, sop_phase = values
             return {
+                "taxonomy_schema_version": MATERIAL_TAXONOMY_SCHEMA_VERSION,
                 "canonical_action_type": action_type,
                 "canonical_object": canonical_object,
                 "sop_phase": sop_phase,
@@ -1486,6 +1608,7 @@ def _canonical_action_fields(primary_object: Any, action_name: Any = None) -> di
         if needle in action_text:
             action_type, canonical_object, sop_phase = values
             return {
+                "taxonomy_schema_version": MATERIAL_TAXONOMY_SCHEMA_VERSION,
                 "canonical_action_type": action_type,
                 "canonical_object": canonical_object,
                 "sop_phase": sop_phase,
@@ -1493,6 +1616,7 @@ def _canonical_action_fields(primary_object: Any, action_name: Any = None) -> di
             }
     action_type, canonical_object, sop_phase = CANONICAL_ACTION_BY_OBJECT["container"]
     return {
+        "taxonomy_schema_version": MATERIAL_TAXONOMY_SCHEMA_VERSION,
         "canonical_action_type": action_type,
         "canonical_object": canonical_object,
         "sop_phase": sop_phase,
@@ -1564,21 +1688,41 @@ def _record(
     frame_type: str | None = None,
 ) -> dict[str, Any]:
     primary_object = micro.get("primary_object") or (micro.get("interaction") or {}).get("primary_object")
+    start_sec = _safe_float(micro.get("start_sec", micro.get("session_start_sec")))
+    end_sec = _safe_float(micro.get("end_sec", micro.get("session_end_sec")))
+    yolo_evidence_count = len([row for row in micro.get("yolo_evidence", []) if isinstance(row, dict)])
+    taxonomy = _canonical_action_fields(primary_object, action_name)
+    evidence_chain = {
+        "schema_version": MATERIAL_REFERENCE_TRACE_SCHEMA_VERSION,
+        "source_clip": str(source),
+        "camera_view": view,
+        "time_start": start_sec,
+        "time_end": end_sec,
+        "yolo_evidence_count": yolo_evidence_count,
+        "canonical_action_type": taxonomy["canonical_action_type"],
+        "candidate_disposition": None,
+    }
     return {
         "schema_version": "material_reference.item.v1",
+        "trace_schema_version": MATERIAL_REFERENCE_TRACE_SCHEMA_VERSION,
         "material_type": material_type,
         "asset_kind": material_type,
         "action_name": action_name,
-        **_canonical_action_fields(primary_object, action_name),
+        **taxonomy,
         "micro_segment_id": micro.get("micro_segment_id"),
         "parent_segment_id": micro.get("parent_segment_id") or micro.get("segment_id"),
         "segment_id": segment.get("segment_id") or micro.get("parent_segment_id") or micro.get("segment_id"),
         "view": view,
+        "camera_view": view,
         "frame_type": frame_type,
-        "start_sec": _safe_float(micro.get("start_sec", micro.get("session_start_sec"))),
-        "end_sec": _safe_float(micro.get("end_sec", micro.get("session_end_sec"))),
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+        "time_start": start_sec,
+        "time_end": end_sec,
         "primary_object": primary_object,
         "source_file": str(source),
+        "source_clip": str(source),
+        "source_clip_path": str(source),
         "stored_file": str(target),
         "stored_filename": target.name,
         "file_name": target.name,
@@ -1588,10 +1732,11 @@ def _record(
         "error": error,
         "yolo_box_required": True,
         "box_filter": "hand_and_primary_object_only",
-        "time_range_sec": f"{_safe_float(micro.get('start_sec', micro.get('session_start_sec'))):.3f}-{_safe_float(micro.get('end_sec', micro.get('session_end_sec'))):.3f}",
+        "time_range_sec": f"{start_sec:.3f}-{end_sec:.3f}",
         "frame_role": frame_type,
         "yolo_annotated_required": True,
-        "yolo_evidence_count": len([row for row in micro.get("yolo_evidence", []) if isinstance(row, dict)]),
+        "yolo_evidence_count": yolo_evidence_count,
+        "evidence_chain": evidence_chain,
     }
 
 

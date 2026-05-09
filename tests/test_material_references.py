@@ -452,6 +452,11 @@ def test_approve_material_candidates_promotes_recommended_files_only(tmp_path: P
     assert len(reference_rows) == 2
     assert {row["asset_kind"] for row in reference_rows} == {KEYFRAME_DIR_NAME, KEY_CLIP_DIR_NAME}
     assert all(row["review_status"] == "accepted" for row in reference_rows)
+    assert all(row["taxonomy_schema_version"] == "material_action_taxonomy.v1" for row in reference_rows)
+    assert all(row["candidate_disposition_schema_version"] == "material_candidate_disposition.v1" for row in reference_rows)
+    assert all(row["evidence_chain"]["schema_version"] == "material_reference_trace.v1" for row in reference_rows)
+    assert all(row["evidence_chain"]["candidate_disposition"] == "approved" for row in reference_rows)
+    assert all(row["source_clip"] for row in reference_rows)
     assert all(Path(row["stored_file"]).exists() for row in reference_rows)
     simplified_root = Path(approval["material_references_summary"]["simplified_material_references"])
     formal_root = formal_material_references_root(session)
@@ -476,7 +481,14 @@ def test_approve_material_candidates_promotes_recommended_files_only(tmp_path: P
     ]
     approved_ids = set(approval["approved_candidate_ids"])
     assert {row["candidate_status"] for row in updated_candidates if row["candidate_id"] in approved_ids} == {"approved"}
+    assert {row["approval_reason_code"] for row in updated_candidates if row["candidate_id"] in approved_ids} == {"representative_yolo_hand_object_evidence"}
+    assert {row["candidate_disposition_schema_version"] for row in updated_candidates if row["candidate_id"] in approved_ids} == {"material_candidate_disposition.v1"}
     assert "not_selected" in {row["candidate_status"] for row in updated_candidates if row["candidate_group_id"] == group_id and row["candidate_id"] not in approved_ids}
+    assert all(
+        row.get("disposition") == "not_selected_after_group_approval"
+        for row in updated_candidates
+        if row["candidate_group_id"] == group_id and row["candidate_id"] not in approved_ids
+    )
     candidate_manifest = json.loads((candidate_root / "manifest.json").read_text(encoding="utf-8"))
     candidate_summary = json.loads((candidate_root / f"{MATERIAL_CANDIDATE_INDEX_BASENAME}.json").read_text(encoding="utf-8"))
     expected_pending = sum(1 for row in updated_candidates if row["candidate_status"] == "pending")
